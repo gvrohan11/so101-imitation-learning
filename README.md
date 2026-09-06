@@ -3,23 +3,18 @@ so101-imitation-learning
 
 Here's the first project, start to finish.
 
-The setup (once): Assemble/plug in the SO-101, calibrate both arms, confirm the follower mirrors the leader when you puppet it. Your M2 drives the arm; a cloud GPU does the training.
+Level 1: make it work. Teleoperate 50 rounds of cube in cup task. Train an ACT policy on this. Then, the arm should do this task autonomously
 
-The task: Pick up a red cube, drop it in a cup. Deliberately simple, with a crisp success/fail moment so the numbers mean something.
+Level 2: reuse this info. Train on 10,20,40,80 demos. Plot success vs # of demos.
+ACT vs diff policy - same data, 2 policies, head-to-head success rate with confidence intervals
 
-The three levels — all one project, one arm, one dataset:
+Level 3 - fine-tune smolVLA (small VLA model) on collected data. This means that we would have fine tuned a small LM, then a small VLA on the data
 
-Level 1 - make it work. Teleoperate ~50 demonstrations of cube-in-cup with a wrist camera, which log to a LeRobotDataset. Train an ACT policy on them. The arm now does the task autonomously — no hardcoded motion, it learned from your demos. This alone is a complete project.
+For the arm: find port -> calibrate -> teleop
 
-Level 2 — make it a study (this is the target). Reuse that same dataset, no new data collection:
-Data-efficiency curve — train on 10 / 20 / 40 / 80 demos, plot success rate vs. number of demos. How much data does the task actually need?
-ACT vs. diffusion policy — same data, two policy types, head-to-head success rate with confidence intervals + a note on failure modes.
-This is what turns "I ran the tutorial" into "I ran an experiment." Get here and it's genuinely strong.
+The data we collect comes from each teleop round: Camera frames, Robot state, Action:
+One demo (ex: 15 seconds of dropping the cube in the cup) = hundreds of synchronized (image, state, action) snapshots
 
-Level 3 — the stretch (optional). Fine-tune SmolVLA (a small vision-language-action model) on your own collected data. Ties to your SmolLM2 work: "I fine-tuned a small LM, then a small VLA on data from a robot on my desk."
 
-The deliverable: A clean public repo (the one I already built — record/train/eval scripts, the eval harness with Wilson CIs, the plotting), a short README framing it as an experiment, one video of the arm succeeding on its own, and the dataset + policy pushed to the HF Hub.
-
-Why it's scoped for ~a week: You collect data once; everything after is compute, not labor. The repo's already wired for exactly this flow.
-
-Whenever the arm arrives, we start at find-port → calibrate → teleop, then record that first dataset.
+# Status
+Validated the full training pipeline in simulation (ACT on the pusht dataset, trained on Apple MPS) before touching hardware — confirming the record→train→eval→plot loop works end to end. Real SO-101 data slots into the same pipeline unchanged.
