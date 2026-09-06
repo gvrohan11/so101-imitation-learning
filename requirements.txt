@@ -1,0 +1,2 @@
+lerobot
+matplotlib>=3.7
