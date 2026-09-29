@@ -12,9 +12,12 @@ data = mujoco.MjData(model)
 mujoco.mj_forward(model, data)
 
 renderer = mujoco.Renderer(model, height=224, width=224)
-renderer.update_scene(data, camera="front")
-frame = renderer.render()
 
-Image.fromarray(frame).save(output)
-print(f"saved camera frame: {output}")
-print(f"frame shape: {frame.shape}")
+try:
+    renderer.update_scene(data, camera="front")
+    frame = renderer.render()
+    Image.fromarray(frame).save(output)
+    print(f"saved camera frame: {output}")
+    print(f"frame shape: {frame.shape}")
+finally:
+    renderer.close()
