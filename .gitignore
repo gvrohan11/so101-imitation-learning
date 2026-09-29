@@ -1,5 +1,4 @@
 outputs/
-*.png
 wandb/
 .venv/
 __pycache__/
