@@ -22,8 +22,10 @@ class BallCupEnv:
         self.frame_skip = frame_skip
         self.horizon = horizon
         self.steps = 0
-        self.touched_ball = False
         self.stable_steps = 0
+        self.grasped_ball = False
+        self.currently_grasped = False
+        
 
         def get_id(kind, name):
             idx = mujoco.mj_name2id(self.model, kind, name)
@@ -117,13 +119,15 @@ class BallCupEnv:
         ]
 
         self.steps = 0
-        self.touched_ball = False
+        self.grasped_ball = False
+        self.currently_grasped = False
         self.stable_steps = 0
         mujoco.mj_forward(self.model, self.data)
 
         return self._observation(), {
             "ball_in_cup": False,
-            "gripper_touched_ball": False,
+            "currently_grasped": self.currently_grasped,
+            "grasped_ball": self.grasped_ball,
         }
 
     def step(self, action):
@@ -144,15 +148,16 @@ class BallCupEnv:
         for _ in range(self.frame_skip):
             mujoco.mj_step(self.model, self.data)
 
-            if self._gripper_touching_ball():
-                self.touched_ball = True
+            self.currently_grasped = self._is_grasped()
+            if self.currently_grasped:
+                self.grasped_ball = True
 
             ball_speed = np.linalg.norm(
                 self.data.qvel[self.ball_qvel:self.ball_qvel + 3]
             )
             settled_in_cup = self._ball_in_cup() and ball_speed < 0.05
 
-            if self.touched_ball and settled_in_cup:
+            if self.grasped_ball and settled_in_cup:
                 self.stable_steps += 1
             else:
                 self.stable_steps = 0
@@ -162,7 +167,8 @@ class BallCupEnv:
 
         info = {
             "ball_in_cup": self._ball_in_cup(),
-            "gripper_touched_ball": self.touched_ball,
+            "currently_grasped": self.currently_grasped,
+            "grasped_ball": self.grasped_ball,
             "is_success": success,
         }
         return self._observation(), float(success), success, truncated, info
