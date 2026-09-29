@@ -1,0 +1,54 @@
+<mujoco model="scene">
+    <include file="so101_new_calib.xml" />
+
+    <visual>
+        <headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3" specular="0 0 0" />
+        <rgba haze="0.15 0.25 0.35 1" />
+        <global azimuth="160" elevation="-20" />
+    </visual>
+
+    <asset>
+        <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0 0 0" width="512"
+            height="3072" />
+        <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="0.2 0.3 0.4"
+            rgb2="0.1 0.2 0.3"
+            markrgb="0.8 0.8 0.8" width="300" height="300" />
+        <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5"
+            reflectance="0.2" />
+    </asset>
+
+    <worldbody>
+        <light pos="0 0 3.5" dir="0 0 -1" directional="true" />
+        <!-- Table: top surface is z=0 -->
+        <geom name="table_top" type="box"
+            pos="0.25 0 -0.025" size="0.45 0.32 0.025"
+            rgba="0.55 0.38 0.22 1"/>
+
+        <!-- Camera aims at the work area -->
+        <body name="camera_target" pos="0.25 0 0.04"/>
+        <camera name="front" mode="targetbody" target="camera_target"
+                pos="0.62 -0.72 0.58" fovy="55"/>
+
+        <!-- Red cup: open-top, octagonal approximation -->
+        <body name="cup" pos="0.25 0.13 0">
+        <geom name="cup_bottom" type="cylinder"
+                pos="0 0 0.005" size="0.055 0.005"
+                rgba="0.85 0.04 0.03 1" friction="1.0 0.01 0.001"/>
+        <geom name="cup_wall_0" type="box" pos=" 0.0500  0.0000 0.050" euler="0 0 0.0000" size="0.005 0.0205 0.040" rgba="0.85 0.04 0.03 1"/>
+        <geom name="cup_wall_1" type="box" pos=" 0.0354  0.0354 0.050" euler="0 0 0.7854" size="0.005 0.0205 0.040" rgba="0.85 0.04 0.03 1"/>
+        <geom name="cup_wall_2" type="box" pos=" 0.0000  0.0500 0.050" euler="0 0 1.5708" size="0.005 0.0205 0.040" rgba="0.85 0.04 0.03 1"/>
+        <geom name="cup_wall_3" type="box" pos="-0.0354  0.0354 0.050" euler="0 0 2.3562" size="0.005 0.0205 0.040" rgba="0.85 0.04 0.03 1"/>
+        <geom name="cup_wall_4" type="box" pos="-0.0500  0.0000 0.050" euler="0 0 3.1416" size="0.005 0.0205 0.040" rgba="0.85 0.04 0.03 1"/>
+        <geom name="cup_wall_5" type="box" pos="-0.0354 -0.0354 0.050" euler="0 0 3.9270" size="0.005 0.0205 0.040" rgba="0.85 0.04 0.03 1"/>
+        <geom name="cup_wall_6" type="box" pos=" 0.0000 -0.0500 0.050" euler="0 0 4.7124" size="0.005 0.0205 0.040" rgba="0.85 0.04 0.03 1"/>
+        <geom name="cup_wall_7" type="box" pos=" 0.0354 -0.0354 0.050" euler="0 0 5.4978" size="0.005 0.0205 0.040" rgba="0.85 0.04 0.03 1"/>
+        </body>
+
+        <!-- Ping-pong ball; smoke test will drop it into the cup -->
+        <body name="ball" pos="0.25 0.13 0.18">
+        <freejoint name="ball_free"/>
+        <geom name="ball_geom" type="sphere" size="0.020" mass="0.0027"
+                rgba="0.96 0.96 0.90 1" friction="0.8 0.01 0.001"/>
+        </body>
+    </worldbody>
+</mujoco>
