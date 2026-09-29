@@ -18,7 +18,7 @@ class BallCupEnv:
         scene = root / "assets" / "SO101" / "ball_cup_scene.xml"
         self.model = mujoco.MjModel.from_xml_path(str(scene))
         self.data = mujoco.MjData(self.model)
-        self.rng = np.random.default_rng(seed)
+        self.rng = np.random.default_rng(seed) # random number generator
         self.frame_skip = frame_skip
         self.horizon = horizon
         self.steps = 0
@@ -61,6 +61,10 @@ class BallCupEnv:
             self.model, height=image_size, width=image_size
         )
 
+        self.gripper_site = get_id(
+            mujoco.mjtObj.mjOBJ_SITE, "gripperframe"
+        )
+
     def _ball_in_cup(self):
         ball = self.data.xpos[self.ball_body]
         cup = self.model.body_pos[self.cup_body]
@@ -96,7 +100,22 @@ class BallCupEnv:
             [self.data.qpos[self.joint_qpos[name]] for name in JOINT_NAMES],
             dtype=np.float32,
         )
-        return {"image": image, "joint_positions": joints}
+
+        state = np.concatenate(
+            [
+                self.data.site_xpos[self.gripper_site], # gripper xyz
+                self.data.xpos[self.ball_body], # ball xyz
+                self.model.body_pos[self.cup_body], # cup xyz
+                self.data.qvel[self.ball_qvel:self.ball_qvel + 3], # ball velocity
+                joints
+            ]
+        ).astype(np.float32)
+
+        return {
+            "image": image, 
+            "joint_positions": joints,
+            "state": state
+        }
 
     def reset(self, seed=None):
         if seed is not None:
