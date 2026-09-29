@@ -171,3 +171,39 @@ class BallCupEnv:
         if self.renderer is not None:
             self.renderer.close()
             self.renderer = None
+
+    def _ball_contact_bodies(self):
+        bodies = set()
+
+        for i in range(self.data.ncon):
+            contact = self.data.contact[i]
+            if self.ball_geom not in (contact.geom1, contact.geom2):
+                continue
+
+            other_geom = (
+                contact.geom2
+                if contact.geom1 == self.ball_geom
+                else contact.geom1
+            )
+            body_id = int(self.model.geom_bodyid[other_geom])
+            if body_id in self.gripper_bodies:
+                bodies.add(body_id)
+
+        return bodies
+
+
+    def _is_grasped(self):
+        fixed_gripper = mujoco.mj_name2id(
+            self.model, mujoco.mjtObj.mjOBJ_BODY, "gripper"
+        )
+        moving_jaw = mujoco.mj_name2id(
+            self.model, mujoco.mjtObj.mjOBJ_BODY, "moving_jaw_so101_v1"
+        )
+
+        touching_both_jaws = {
+            fixed_gripper,
+            moving_jaw,
+        }.issubset(self._ball_contact_bodies())
+
+        ball_is_lifted = self.data.xpos[self.ball_body][2] > 0.035
+        return touching_both_jaws and ball_is_lifted
