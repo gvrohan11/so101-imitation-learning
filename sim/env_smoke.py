@@ -1,6 +1,6 @@
 import numpy as np
 
-from sim.ball_cup_env import BallCupEnv
+from ball_cup_env import BallCupEnv
 
 env = BallCupEnv(seed=7)
 try:
