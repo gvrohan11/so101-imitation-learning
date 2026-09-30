@@ -3,8 +3,8 @@ from itertools import product
 import mujoco
 import numpy as np
 
-from ball_cup_env import JOINT_NAMES, BallCupEnv
-from collision_check import JawTableCollisionChecker
+from sim.ball_cup_env import JOINT_NAMES, BallCupEnv
+from sim.collision_check import JawTableCollisionChecker
 
 
 def main():
@@ -104,6 +104,7 @@ def main():
         ik_solutions = 0
         pinches = 0
         safe_paths = []
+        safe_pinch_candidates = []
 
         for wrist_flex, wrist_roll, offset in product(
             wrist_flex_values, wrist_roll_values, offsets
@@ -117,6 +118,8 @@ def main():
             contact_q, contact_error = solve_site(
                 contact_target, wrist_flex, wrist_roll, gripper_closed
             )
+            contact_open_q = contact_q.copy()
+            contact_open_q[-1] = gripper_open
 
             if pregrasp_error > 0.005 or contact_error > 0.005:
                 continue
@@ -126,42 +129,46 @@ def main():
             # approach paths to be clear of moving-jaw/table contact.
             if not checker.candidate_is_safe(start_q, pregrasp_q):
                 continue
-            if not checker.candidate_is_safe(pregrasp_q, contact_q):
+            if not checker.candidate_is_safe(pregrasp_q, contact_open_q):
+                continue
+            if not checker.candidate_is_safe(contact_open_q, contact_q):
                 continue
             safe_paths.append(
                 (pregrasp_error + contact_error, wrist_flex,
-                 wrist_roll, offset, pregrasp_q, contact_q)
+                 wrist_roll, offset, pregrasp_q, contact_open_q, contact_q)
             )
 
             if pinches_ball(contact_q):
                 pinches += 1
+                safe_pinch_candidates.append(safe_paths[-1])
 
         print("ball:", np.round(ball, 4))
         print("IK-reachable candidates:", ik_solutions)
-        print("collision-free approach paths:", len(safe_paths))
-        print("collision-free paths with two-jaw ball pinch:", pinches)
+        print("paths clear of moving-jaw/table contact:", len(safe_paths))
+        print("static two-jaw contact candidates:", pinches)
 
         if pinches == 0:
             print(
                 "No candidate passed all checks. Do not execute the old pose; "
                 "the next issue is pose/scene geometry, not PPO."
             )
-            return
+            return []
 
         safe_paths.sort(key=lambda item: item[0])
-        print("\nFirst collision-free pinch candidates:")
+        safe_pinch_candidates.sort(key=lambda item: item[0])
+        print("\nFirst jaw-table-clear static two-jaw candidates:")
         shown = 0
-        for total_error, wrist_flex, wrist_roll, offset, _, _ in safe_paths:
+        for (
+            total_error,
+            wrist_flex,
+            wrist_roll,
+            offset,
+            _,
+            _,
+            _,
+        ) in safe_pinch_candidates:
             pregrasp = ball + offset + np.array([0.0, 0.0, 0.06])
             contact = ball + offset
-            # Print only candidates that actually pinch the ball.
-            # Recreate the contact configuration for this candidate.
-            contact_q, _ = solve_site(
-                contact, wrist_flex, wrist_roll, gripper_closed
-            )
-            if not pinches_ball(contact_q):
-                continue
-
             print(
                 f"  wrist_flex={wrist_flex:+.3f}, "
                 f"wrist_roll={wrist_roll:+.3f}, "
@@ -173,6 +180,7 @@ def main():
             shown += 1
             if shown == 10:
                 break
+        return safe_pinch_candidates
 
     finally:
         env.close()
