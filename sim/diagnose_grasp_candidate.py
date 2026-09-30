@@ -168,6 +168,7 @@ def main():
         waypoint_count = 60
         frames_per_waypoint = 7
         lost_pinch_steps = 0
+        pinch_loss_logged = False
         lift_aborted = False
 
         print("starting cautious 6 cm lift with gripper closed")
@@ -292,6 +293,58 @@ def main():
                     lost_pinch_steps = 0
                 else:
                     lost_pinch_steps += 1
+
+                    if not pinch_loss_logged:
+                        pinch_loss_logged = True
+                        print(
+                            f"FIRST PINCH LOSS at lift waypoint "
+                            f"{waypoint_index}, substep {substep}"
+                        )
+                        print(
+                            "  site:",
+                            np.round(data.site_xpos[env.gripper_site], 4),
+                            "ball:",
+                            np.round(ball_now, 4),
+                            "gripper angle:",
+                            round(float(data.qpos[qpos_ids[5]]), 4),
+                        )
+
+                        found_ball_contact = False
+                        for contact_index in range(data.ncon):
+                            contact = data.contact[contact_index]
+                            if env.ball_geom not in (
+                                contact.geom1, contact.geom2
+                            ):
+                                continue
+
+                            other_geom = (
+                                contact.geom2
+                                if contact.geom1 == env.ball_geom
+                                else contact.geom1
+                            )
+                            other_body = int(model.geom_bodyid[other_geom])
+                            contact_force = np.zeros(6, dtype=np.float64)
+                            mujoco.mj_contactForce(
+                                model, data, contact_index, contact_force
+                            )
+
+                            print(
+                                "  remaining ball contact:",
+                                mujoco.mj_id2name(
+                                    model,
+                                    mujoco.mjtObj.mjOBJ_BODY,
+                                    other_body,
+                                ),
+                                "distance=",
+                                round(float(contact.dist), 5),
+                                "normal_force=",
+                                round(float(contact_force[0]), 5),
+                            )
+                            found_ball_contact = True
+
+                        if not found_ball_contact:
+                            print("  no ball contacts remain")
+
                     if lost_pinch_steps >= 5:
                         print(
                             f"ABORT: pinch lost for 5 frames; "
