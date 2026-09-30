@@ -3,8 +3,8 @@ from itertools import product
 import mujoco
 import numpy as np
 
-from sim.ball_cup_env import JOINT_NAMES, BallCupEnv
-from sim.collision_check import JawTableCollisionChecker
+from ball_cup_env import JOINT_NAMES, BallCupEnv
+from collision_check import JawTableCollisionChecker
 
 
 def main():
