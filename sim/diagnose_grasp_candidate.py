@@ -154,64 +154,166 @@ def main():
             return 1
 
         ball_after_close = data.xpos[env.ball_body].copy()
-        lift_target = pregrasp_q.copy()
-        lift_target[-1] = contact_closed_q[-1]
-
-        if not checker.candidate_is_safe(
-            data.qpos[qpos_ids].copy(), lift_target
-        ):
-            print("ABORT: closed-gripper lift path failed jaw/table check.")
-            return 1
-
         lift_start = data.qpos[qpos_ids].copy()
+        lift_start_site = data.site_xpos[env.gripper_site].copy()
+        lift_target = lift_start.copy()
+        lift_target[3:6] = contact_closed_q[3:6]
+        lift_dof_ids = np.array(
+            [model.jnt_dofadr[mujoco.mj_name2id(
+                model, mujoco.mjtObj.mjOBJ_JOINT, name
+            )] for name in JOINT_NAMES],
+            dtype=np.int32,
+        )
+        fixed_wrist_and_gripper = contact_closed_q[3:6].copy()
+        waypoint_count = 60
+        frames_per_waypoint = 7
         lost_pinch_steps = 0
         lift_aborted = False
 
         print("starting cautious 6 cm lift with gripper closed")
 
-        for frame in range(400):
-            fraction = (frame + 1) / 400
-            commanded = lift_start + fraction * (lift_target - lift_start)
+        def solve_lift_waypoint(target_xyz, seed_positions):
+            saved_qpos = data.qpos.copy()
+            data.qpos[qpos_ids] = seed_positions
+            data.qpos[qpos_ids[3:6]] = fixed_wrist_and_gripper
 
-            _, _, terminated, truncated, _ = env.step(
-                action_for(commanded)
+            try:
+                for _ in range(120):
+                    mujoco.mj_forward(model, data)
+                    error = target_xyz - data.site_xpos[env.gripper_site]
+                    if np.linalg.norm(error) < 0.001:
+                        break
+
+                    jac_pos = np.zeros((3, model.nv))
+                    jac_rot = np.zeros((3, model.nv))
+                    mujoco.mj_jacSite(
+                        model,
+                        data,
+                        jac_pos,
+                        jac_rot,
+                        env.gripper_site,
+                    )
+                    jac = jac_pos[:, lift_dof_ids[:3]]
+                    delta = jac.T @ np.linalg.solve(
+                        jac @ jac.T + 0.05**2 * np.eye(3), error
+                    )
+                    delta_length = np.linalg.norm(delta)
+                    if delta_length > 0.05:
+                        delta *= 0.05 / delta_length
+
+                    for joint_index in range(3):
+                        qpos_index = qpos_ids[joint_index]
+                        joint_id = mujoco.mj_name2id(
+                            model,
+                            mujoco.mjtObj.mjOBJ_JOINT,
+                            JOINT_NAMES[joint_index],
+                        )
+                        low, high = model.jnt_range[joint_id]
+                        data.qpos[qpos_index] = np.clip(
+                            data.qpos[qpos_index] + delta[joint_index],
+                            low,
+                            high,
+                        )
+
+                mujoco.mj_forward(model, data)
+                solution = data.qpos[qpos_ids].copy()
+                residual = float(
+                    np.linalg.norm(
+                        target_xyz - data.site_xpos[env.gripper_site]
+                    )
+                )
+                return solution, residual
+            finally:
+                data.qpos[:] = saved_qpos
+                mujoco.mj_forward(model, data)
+
+        for waypoint_index in range(1, waypoint_count + 1):
+            waypoint_xyz = lift_start_site + np.array(
+                [0.0, 0.0, 0.06 * waypoint_index / waypoint_count]
             )
-
-            actual_positions = data.qpos[qpos_ids].copy()
-            ball_now = data.xpos[env.ball_body].copy()
-
-            if not checker.pose_is_collision_free(actual_positions):
-                print(f"ABORT: jaw/table collision at lift frame {frame}.")
-                lift_aborted = True
-                break
-
-            if terminated or truncated:
-                print(f"ABORT: episode ended at lift frame {frame}.")
-                lift_aborted = True
-                break
-
-            sideways_shift = np.linalg.norm(
-                ball_now[:2] - ball_after_close[:2]
+            actual_start = data.qpos[qpos_ids].copy()
+            waypoint_q, ik_error = solve_lift_waypoint(
+                waypoint_xyz, actual_start
             )
-            if sideways_shift > 0.012:
+            if ik_error > 0.003:
                 print(
-                    f"ABORT: ball slid sideways "
-                    f"{sideways_shift * 1000:.1f} mm during lift."
+                    f"ABORT: Cartesian lift IK error at waypoint "
+                    f"{waypoint_index}: {ik_error * 1000:.1f} mm."
+                )
+                lift_aborted = True
+                break
+            if not checker.candidate_is_safe(actual_start, waypoint_q):
+                print(
+                    f"ABORT: jaw/table check failed at lift waypoint "
+                    f"{waypoint_index}."
                 )
                 lift_aborted = True
                 break
 
-            if env._is_pinched():
-                lost_pinch_steps = 0
-            else:
-                lost_pinch_steps += 1
-                if lost_pinch_steps >= 5:
+            for substep in range(frames_per_waypoint):
+                fraction = (substep + 1) / frames_per_waypoint
+                commanded = actual_start + fraction * (
+                    waypoint_q - actual_start
+                )
+                _, _, terminated, truncated, _ = env.step(
+                    action_for(commanded)
+                )
+
+                actual_positions = data.qpos[qpos_ids].copy()
+                ball_now = data.xpos[env.ball_body].copy()
+                if not checker.pose_is_collision_free(actual_positions):
                     print(
-                        f"ABORT: pinch lost for 5 frames; "
-                        f"ball z={ball_now[2]:.4f} m."
+                        f"ABORT: jaw/table collision at lift waypoint "
+                        f"{waypoint_index}, substep {substep}."
                     )
                     lift_aborted = True
                     break
+
+                if terminated or truncated:
+                    print(
+                        f"ABORT: episode ended at lift waypoint "
+                        f"{waypoint_index}, substep {substep}."
+                    )
+                    lift_aborted = True
+                    break
+
+                sideways_shift = np.linalg.norm(
+                    ball_now[:2] - ball_after_close[:2]
+                )
+                if sideways_shift > 0.012:
+                    print(
+                        f"ABORT: ball slid sideways "
+                        f"{sideways_shift * 1000:.1f} mm during lift."
+                    )
+                    lift_aborted = True
+                    break
+
+                if env._is_pinched():
+                    lost_pinch_steps = 0
+                else:
+                    lost_pinch_steps += 1
+                    if lost_pinch_steps >= 5:
+                        print(
+                            f"ABORT: pinch lost for 5 frames; "
+                            f"ball z={ball_now[2]:.4f} m."
+                        )
+                        lift_aborted = True
+                        break
+
+            if lift_aborted:
+                break
+
+            waypoint_joint_error = np.max(
+                np.abs(data.qpos[qpos_ids] - waypoint_q)
+            )
+            if waypoint_joint_error > 0.03:
+                print(
+                    f"ABORT: joint target error at lift waypoint "
+                    f"{waypoint_index} is {waypoint_joint_error:.3f} rad."
+                )
+                lift_aborted = True
+                break
+            lift_target = waypoint_q
 
         ball_after_lift = data.xpos[env.ball_body].copy()
         rise = ball_after_lift[2] - ball_after_close[2]
