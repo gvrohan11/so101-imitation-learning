@@ -87,3 +87,15 @@ class JawTableCollisionChecker:
             if not self.pose_is_collision_free(pose):
                 return False
         return True
+
+    def candidate_is_safe(
+        self, start_positions, candidate_positions, max_joint_step=0.02
+    ):
+        """Accept an IK candidate only if its pose and path are clear."""
+        if not self.pose_is_collision_free(candidate_positions):
+            return False
+        return self.trajectory_is_collision_free(
+            start_positions,
+            candidate_positions,
+            max_joint_step=max_joint_step,
+        )
