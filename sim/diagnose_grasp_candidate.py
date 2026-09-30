@@ -148,7 +148,91 @@ def main():
         print("gripper site after closing:", np.round(
             data.site_xpos[env.gripper_site], 4
         ))
-        return 0
+
+        if not env._is_pinched():
+            print("ABORT: ball is not pinched; skipping lift.")
+            return 1
+
+        ball_after_close = data.xpos[env.ball_body].copy()
+        lift_target = pregrasp_q.copy()
+        lift_target[-1] = contact_closed_q[-1]
+
+        if not checker.candidate_is_safe(
+            data.qpos[qpos_ids].copy(), lift_target
+        ):
+            print("ABORT: closed-gripper lift path failed jaw/table check.")
+            return 1
+
+        lift_start = data.qpos[qpos_ids].copy()
+        lost_pinch_steps = 0
+        lift_aborted = False
+
+        print("starting cautious 6 cm lift with gripper closed")
+
+        for frame in range(400):
+            fraction = (frame + 1) / 400
+            commanded = lift_start + fraction * (lift_target - lift_start)
+
+            _, _, terminated, truncated, _ = env.step(
+                action_for(commanded)
+            )
+
+            actual_positions = data.qpos[qpos_ids].copy()
+            ball_now = data.xpos[env.ball_body].copy()
+
+            if not checker.pose_is_collision_free(actual_positions):
+                print(f"ABORT: jaw/table collision at lift frame {frame}.")
+                lift_aborted = True
+                break
+
+            if terminated or truncated:
+                print(f"ABORT: episode ended at lift frame {frame}.")
+                lift_aborted = True
+                break
+
+            sideways_shift = np.linalg.norm(
+                ball_now[:2] - ball_after_close[:2]
+            )
+            if sideways_shift > 0.012:
+                print(
+                    f"ABORT: ball slid sideways "
+                    f"{sideways_shift * 1000:.1f} mm during lift."
+                )
+                lift_aborted = True
+                break
+
+            if env._is_pinched():
+                lost_pinch_steps = 0
+            else:
+                lost_pinch_steps += 1
+                if lost_pinch_steps >= 5:
+                    print(
+                        f"ABORT: pinch lost for 5 frames; "
+                        f"ball z={ball_now[2]:.4f} m."
+                    )
+                    lift_aborted = True
+                    break
+
+        ball_after_lift = data.xpos[env.ball_body].copy()
+        rise = ball_after_lift[2] - ball_after_close[2]
+
+        print("ball after close:", np.round(ball_after_close, 4))
+        print("ball after lift:", np.round(ball_after_lift, 4))
+        print(f"ball rise: {rise * 1000:.1f} mm")
+        print("pinched at end:", bool(env._is_pinched()))
+        print("grasped at end:", bool(env._is_grasped()))
+        lift_joint_error = np.max(
+            np.abs(data.qpos[qpos_ids] - lift_target)
+        )
+        lift_success = (
+            not lift_aborted
+            and lift_joint_error <= 0.03
+            and env._is_grasped()
+        )
+
+        print(f"lift joint error: {lift_joint_error:.3f} rad")
+        print("lift success:", lift_success)
+        return 0 if lift_success else 1
     finally:
         env.close()
 
