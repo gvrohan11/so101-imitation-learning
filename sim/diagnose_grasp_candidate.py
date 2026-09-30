@@ -29,7 +29,7 @@ def main():
             pregrasp_q,
             contact_open_q,
             contact_closed_q,
-        ) = candidates[0]
+        ) = candidates[1]
 
         def action_for(joint_positions):
             action = []
