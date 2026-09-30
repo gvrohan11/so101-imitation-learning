@@ -13,7 +13,14 @@ JOINT_NAMES = (
 )
 
 class BallCupEnv:
-    def __init__(self, image_size=224, frame_skip=20, horizon=300, seed=None):
+    def __init__(
+        self,
+        image_size=224,
+        frame_skip=20,
+        horizon=300,
+        seed=None,
+        render_images=True,
+    ):
         root = Path(__file__).resolve().parents[1]
         scene = root / "assets" / "SO101" / "ball_cup_scene.xml"
         self.model = mujoco.MjModel.from_xml_path(str(scene))
@@ -23,9 +30,13 @@ class BallCupEnv:
         self.horizon = horizon
         self.steps = 0
         self.stable_steps = 0
+        self.currently_pinched = False
+        self.pinched_ball = False
         self.grasped_ball = False
         self.currently_grasped = False
-        
+        self.render_images = render_images
+        self.previous_gripper_ball_distance = None
+        self.previous_ball_cup_distance = None
 
         def get_id(kind, name):
             idx = mujoco.mj_name2id(self.model, kind, name)
@@ -52,13 +63,21 @@ class BallCupEnv:
         self.ball_geom = get_id(mujoco.mjtObj.mjOBJ_GEOM, "ball_geom")
         self.cup_body = get_id(mujoco.mjtObj.mjOBJ_BODY, "cup")
 
+        self.fixed_gripper_body = get_id(
+            mujoco.mjtObj.mjOBJ_BODY, "gripper"
+        )
+        self.moving_jaw_body = get_id(
+            mujoco.mjtObj.mjOBJ_BODY, "moving_jaw_so101_v1"
+        )
         self.gripper_bodies = {
-            get_id(mujoco.mjtObj.mjOBJ_BODY, "gripper"),
-            get_id(mujoco.mjtObj.mjOBJ_BODY, "moving_jaw_so101_v1"),
+            self.fixed_gripper_body,
+            self.moving_jaw_body,
         }
 
-        self.renderer = mujoco.Renderer(
-            self.model, height=image_size, width=image_size
+        self.renderer = (
+            mujoco.Renderer(self.model, height=image_size, width=image_size)
+            if render_images
+            else None
         )
 
         self.gripper_site = get_id(
@@ -93,8 +112,10 @@ class BallCupEnv:
         return False
 
     def _observation(self):
-        self.renderer.update_scene(self.data, camera="front")
-        image = self.renderer.render().copy()
+        image = None
+        if self.renderer is not None:
+            self.renderer.update_scene(self.data, camera="front")
+            image = self.renderer.render().copy()
 
         joints = np.array(
             [self.data.qpos[self.joint_qpos[name]] for name in JOINT_NAMES],
@@ -138,13 +159,23 @@ class BallCupEnv:
         ]
 
         self.steps = 0
+        self.currently_pinched = False
+        self.pinched_ball = False
         self.grasped_ball = False
         self.currently_grasped = False
         self.stable_steps = 0
         mujoco.mj_forward(self.model, self.data)
 
+        gripper = self.data.site_xpos[self.gripper_site]
+        ball = self.data.xpos[self.ball_body]
+        cup = self.model.body_pos[self.cup_body]
+        self.previous_gripper_ball_distance = np.linalg.norm(gripper - ball)
+        self.previous_ball_cup_distance = np.linalg.norm(ball[:2] - cup[:2])
+
         return self._observation(), {
             "ball_in_cup": False,
+            "currently_pinched": self.currently_pinched,
+            "pinched_ball": self.pinched_ball,
             "currently_grasped": self.currently_grasped,
             "grasped_ball": self.grasped_ball,
         }
@@ -164,8 +195,23 @@ class BallCupEnv:
             )
 
         self.steps += 1
+        had_pinched_ball = self.pinched_ball
+        had_grasped_ball = self.grasped_ball
+        lift_progress = 0.0
+        previous_ball_height = float(self.data.xpos[self.ball_body][2])
         for _ in range(self.frame_skip):
             mujoco.mj_step(self.model, self.data)
+
+            self.currently_pinched = self._is_pinched()
+            if self.currently_pinched:
+                self.pinched_ball = True
+                current_ball_height = float(self.data.xpos[self.ball_body][2])
+                lift_progress += np.clip(
+                    current_ball_height - previous_ball_height,
+                    -0.005,
+                    0.005,
+                )
+            previous_ball_height = float(self.data.xpos[self.ball_body][2])
 
             self.currently_grasped = self._is_grasped()
             if self.currently_grasped:
@@ -184,13 +230,61 @@ class BallCupEnv:
         success = self.stable_steps >= 150
         truncated = self.steps >= self.horizon
 
+        gripper = self.data.site_xpos[self.gripper_site]
+        ball = self.data.xpos[self.ball_body]
+        cup = self.model.body_pos[self.cup_body]
+        gripper_ball_distance = np.linalg.norm(gripper - ball)
+        ball_cup_distance = np.linalg.norm(ball[:2] - cup[:2])
+
+        reward_approach = 0.0
+        reward_pinch = 0.0
+        reward_lift = 0.0
+        reward_grasp = 0.0
+        reward_delivery = 0.0
+        reward_success = 0.0
+        if not had_grasped_ball:
+            progress = self.previous_gripper_ball_distance - gripper_ball_distance
+            reward_approach = 10.0 * np.clip(progress, -0.05, 0.05)
+            if self.pinched_ball and not had_pinched_ball:
+                reward_pinch = 1.0
+            if self.currently_pinched:
+                reward_lift = 40.0 * lift_progress
+            if self.grasped_ball:
+                reward_grasp = 5.0 # grasp reward given only after ball has risen past threshold
+        else:
+            if self.currently_grasped:
+                progress = self.previous_ball_cup_distance - ball_cup_distance
+                reward_delivery = 10.0 * np.clip(progress, -0.05, 0.05)
+
+        if success:
+            reward_success = 10.0
+
+        reward = float(
+            reward_approach
+            + reward_pinch
+            + reward_lift
+            + reward_grasp
+            + reward_delivery
+            + reward_success
+        )
+        self.previous_gripper_ball_distance = gripper_ball_distance
+        self.previous_ball_cup_distance = ball_cup_distance
+
         info = {
             "ball_in_cup": self._ball_in_cup(),
+            "currently_pinched": self.currently_pinched,
+            "pinched_ball": self.pinched_ball,
             "currently_grasped": self.currently_grasped,
             "grasped_ball": self.grasped_ball,
             "is_success": success,
+            "reward_approach": float(reward_approach),
+            "reward_pinch": float(reward_pinch),
+            "reward_lift": float(reward_lift),
+            "reward_grasp": float(reward_grasp),
+            "reward_delivery": float(reward_delivery),
+            "reward_success": float(reward_success),
         }
-        return self._observation(), float(success), success, truncated, info
+        return self._observation(), reward, success, truncated, info
 
     def close(self):
         if self.renderer is not None:
@@ -217,18 +311,12 @@ class BallCupEnv:
         return bodies
 
 
-    def _is_grasped(self):
-        fixed_gripper = mujoco.mj_name2id(
-            self.model, mujoco.mjtObj.mjOBJ_BODY, "gripper"
-        )
-        moving_jaw = mujoco.mj_name2id(
-            self.model, mujoco.mjtObj.mjOBJ_BODY, "moving_jaw_so101_v1"
-        )
-
-        touching_both_jaws = {
-            fixed_gripper,
-            moving_jaw,
+    def _is_pinched(self):
+        return {
+            self.fixed_gripper_body,
+            self.moving_jaw_body,
         }.issubset(self._ball_contact_bodies())
 
+    def _is_grasped(self):
         ball_is_lifted = self.data.xpos[self.ball_body][2] > 0.035
-        return touching_both_jaws and ball_is_lifted
+        return self._is_pinched() and ball_is_lifted
