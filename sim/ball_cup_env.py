@@ -61,6 +61,12 @@ class BallCupEnv:
         self.ball_qvel = self.model.jnt_dofadr[self.ball_joint]
         self.ball_body = get_id(mujoco.mjtObj.mjOBJ_BODY, "ball")
         self.ball_geom = get_id(mujoco.mjtObj.mjOBJ_GEOM, "ball_geom")
+        self.fixed_finger_pad_geom = get_id(
+            mujoco.mjtObj.mjOBJ_GEOM, "fixed_finger_pad"
+        )
+        self.moving_finger_pad_geom = get_id(
+            mujoco.mjtObj.mjOBJ_GEOM, "moving_finger_pad"
+        )
         self.cup_body = get_id(mujoco.mjtObj.mjOBJ_BODY, "cup")
 
         self.fixed_gripper_body = get_id(
@@ -312,10 +318,21 @@ class BallCupEnv:
 
 
     def _is_pinched(self):
-        return {
-            self.fixed_gripper_body,
-            self.moving_jaw_body,
-        }.issubset(self._ball_contact_bodies())
+        contacted_geoms = set()
+
+        for i in range(self.data.ncon):
+            contact = self.data.contact[i]
+
+            if self.ball_geom == contact.geom1:
+                contacted_geoms.add(int(contact.geom2))
+            elif self.ball_geom == contact.geom2:
+                contacted_geoms.add(int(contact.geom1))
+
+        required_pads = {
+            self.fixed_finger_pad_geom,
+            self.moving_finger_pad_geom,
+        }
+        return required_pads.issubset(contacted_geoms)
 
     def _is_grasped(self):
         ball_is_lifted = self.data.xpos[self.ball_body][2] > 0.035

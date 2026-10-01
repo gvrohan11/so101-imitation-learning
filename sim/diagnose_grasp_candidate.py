@@ -216,75 +216,29 @@ def main():
             return result
 
         ball_after_close = ball_position()
-        fixed_source_geom = mujoco.mj_name2id(
-            model, mujoco.mjtObj.mjOBJ_GEOM, "fixed_finger_source"
+        fixed_pad_geom = mujoco.mj_name2id(
+            model, mujoco.mjtObj.mjOBJ_GEOM, "fixed_finger_pad"
         )
-        moving_source_geom = mujoco.mj_name2id(
-            model, mujoco.mjtObj.mjOBJ_GEOM, "moving_finger_source"
+        moving_pad_geom = mujoco.mj_name2id(
+            model, mujoco.mjtObj.mjOBJ_GEOM, "moving_finger_pad"
         )
-        source_geoms = {fixed_source_geom, moving_source_geom}
+        pad_geoms = {fixed_pad_geom, moving_pad_geom}
+        contacted_pads = set()
 
-        # Keep the deepest ball contact for each actual finger mesh.
-        best_contact = {}
         for contact_index in range(data.ncon):
             contact = data.contact[contact_index]
-            geom1 = int(contact.geom1)
-            geom2 = int(contact.geom2)
 
-            if geom1 == env.ball_geom:
-                finger_geom = geom2
-            elif geom2 == env.ball_geom:
-                finger_geom = geom1
+            if env.ball_geom == contact.geom1:
+                other_geom = int(contact.geom2)
+            elif env.ball_geom == contact.geom2:
+                other_geom = int(contact.geom1)
             else:
                 continue
 
-            if finger_geom not in source_geoms:
-                continue
+            if other_geom in pad_geoms:
+                contacted_pads.add(other_geom)
 
-            previous = best_contact.get(finger_geom)
-            if previous is None or contact.dist < previous.dist:
-                best_contact[finger_geom] = contact
-
-        pinched_after_close = source_geoms.issubset(best_contact)
-        print(
-            "  after close:",
-            f"actual_finger_mesh_contacts={len(best_contact)}/2",
-            f"pinched={pinched_after_close}",
-            f"ball={np.round(ball_after_close, 4)}",
-        )
-
-        if pinched_after_close:
-            ball_radius = 0.020
-            pad_radius = 0.006
-            desired_overlap = 0.001
-            for finger_geom, contact in best_contact.items():
-                jaw_body = int(model.geom_bodyid[finger_geom])
-                body_pos = data.xpos[jaw_body].copy()
-                body_rot = data.xmat[jaw_body].reshape(3, 3).copy()
-
-                outward = contact.pos - ball_after_close
-                outward_norm = np.linalg.norm(outward)
-                if outward_norm < 1e-8:
-                    continue
-                outward /= outward_norm
-
-                pad_world = ball_after_close + outward * (
-                    ball_radius + pad_radius - desired_overlap
-                )
-                pad_local = body_rot.T @ (pad_world - body_pos)
-
-                geom_name = mujoco.mj_id2name(
-                    model, mujoco.mjtObj.mjOBJ_GEOM, finger_geom
-                )
-                body_name = mujoco.mj_id2name(
-                    model, mujoco.mjtObj.mjOBJ_BODY, jaw_body
-                )
-                print(
-                    f"PAD {body_name} / {geom_name}: "
-                    f"pos={pad_local[0]:.6f} "
-                    f"{pad_local[1]:.6f} "
-                    f"{pad_local[2]:.6f}"
-                )
+        pinched_after_close = pad_geoms.issubset(contacted_pads)
         ball_lift_reference = ball_after_close
         print(
             "  after close:",
