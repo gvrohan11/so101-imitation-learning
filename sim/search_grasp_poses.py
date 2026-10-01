@@ -151,6 +151,7 @@ def main():
         safe_pinch_candidates = []
         best_opposition = None
         best_pose = None
+        best_contact_q = None
 
         for wrist_flex, wrist_roll, offset in product(
             wrist_flex_values, wrist_roll_values, offsets
@@ -190,6 +191,7 @@ def main():
                 if best_opposition is None or opposition < best_opposition:
                     best_opposition = opposition
                     best_pose = (wrist_flex, wrist_roll, offset.copy())
+                    best_contact_q = contact_q.copy()
 
             if is_pinched:
                 pinches += 1
@@ -207,6 +209,28 @@ def main():
                 "| pose:",
                 best_pose,
             )
+
+            data.qpos[qpos_ids] = best_contact_q
+            mujoco.mj_forward(model, data)
+            ball_center = data.xpos[env.ball_body].copy()
+            print("Ball center:", np.round(ball_center, 4))
+
+            for label, pad_id in (
+                ("fixed", env.fixed_finger_pad_geom),
+                ("moving", env.moving_finger_pad_geom),
+            ):
+                for i in range(data.ncon):
+                    contact = data.contact[i]
+                    pair = {int(contact.geom1), int(contact.geom2)}
+                    if env.ball_geom in pair and pad_id in pair:
+                        point = contact.pos.copy()
+                        print(
+                            f"{label} pad: geom center="
+                            f"{np.round(data.geom_xpos[pad_id], 4)}, "
+                            f"contact point={np.round(point, 4)}, "
+                            f"from ball center={np.round(point - ball_center, 4)}"
+                        )
+                        break
         else:
             print("No candidate had simultaneous contact with both pads.")
 
