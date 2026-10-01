@@ -231,6 +231,31 @@ def main():
                             f"from ball center={np.round(point - ball_center, 4)}"
                         )
                         break
+
+            closed_centers = {
+                "fixed": data.geom_xpos[env.fixed_finger_pad_geom].copy(),
+                "moving": data.geom_xpos[env.moving_finger_pad_geom].copy(),
+            }
+
+            data.qpos[qpos_ids[-1]] = gripper_open
+            mujoco.mj_forward(model, data)
+
+            print(
+                "Fixed pad center when open:",
+                np.round(data.geom_xpos[env.fixed_finger_pad_geom], 4),
+            )
+            print(
+                "Moving pad center when open:",
+                np.round(data.geom_xpos[env.moving_finger_pad_geom], 4),
+            )
+            print(
+                "Moving-pad opening travel:",
+                np.round(
+                    data.geom_xpos[env.moving_finger_pad_geom]
+                    - closed_centers["moving"],
+                    4,
+                ),
+            )
         else:
             print("No candidate had simultaneous contact with both pads.")
 
