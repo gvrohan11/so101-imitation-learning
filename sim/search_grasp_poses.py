@@ -96,15 +96,61 @@ def main():
             saved_qpos = data.qpos.copy()
             data.qpos[qpos_ids] = joint_positions
             mujoco.mj_forward(model, data)
-            result = env._is_pinched()
+
+            pad_contacts = {}
+            for i in range(data.ncon):
+                contact = data.contact[i]
+
+                if contact.geom1 == env.ball_geom:
+                    pad_id = int(contact.geom2)
+                elif contact.geom2 == env.ball_geom:
+                    pad_id = int(contact.geom1)
+                else:
+                    continue
+
+                if pad_id not in (
+                    env.fixed_finger_pad_geom,
+                    env.moving_finger_pad_geom,
+                ):
+                    continue
+
+                old = pad_contacts.get(pad_id)
+                if old is None or contact.dist < old[0]:
+                    pad_contacts[pad_id] = (
+                        float(contact.dist),
+                        contact.pos.copy(),
+                    )
+
+            opposition = None
+            required = (
+                env.fixed_finger_pad_geom,
+                env.moving_finger_pad_geom,
+            )
+            if all(pad in pad_contacts for pad in required):
+                center = data.xpos[env.ball_body]
+                directions = []
+                for pad in required:
+                    direction = pad_contacts[pad][1] - center
+                    length = np.linalg.norm(direction)
+                    if length > 1e-8:
+                        direction = direction / length
+                    directions.append(direction)
+                if all(np.linalg.norm(direction) > 0.0 for direction in directions):
+                    opposition = float(
+                        np.dot(directions[0], directions[1])
+                    )
+
+            is_pinched = bool(env._is_pinched())
             data.qpos[:] = saved_qpos
             mujoco.mj_forward(model, data)
-            return result
+            return is_pinched, opposition
 
         ik_solutions = 0
         pinches = 0
         safe_paths = []
         safe_pinch_candidates = []
+        best_opposition = None
+        best_pose = None
 
         for wrist_flex, wrist_roll, offset in product(
             wrist_flex_values, wrist_roll_values, offsets
@@ -138,7 +184,14 @@ def main():
                  wrist_roll, offset, pregrasp_q, contact_open_q, contact_q)
             )
 
-            if pinches_ball(contact_q):
+            is_pinched, opposition = pinches_ball(contact_q)
+
+            if opposition is not None:
+                if best_opposition is None or opposition < best_opposition:
+                    best_opposition = opposition
+                    best_pose = (wrist_flex, wrist_roll, offset.copy())
+
+            if is_pinched:
                 pinches += 1
                 safe_pinch_candidates.append(safe_paths[-1])
 
@@ -146,6 +199,16 @@ def main():
         print("IK-reachable candidates:", ik_solutions)
         print("paths clear of moving-jaw/table contact:", len(safe_paths))
         print("static two-jaw contact candidates:", pinches)
+
+        if best_opposition is not None:
+            print(
+                "Best two-pad contact dot product:",
+                round(best_opposition, 3),
+                "| pose:",
+                best_pose,
+            )
+        else:
+            print("No candidate had simultaneous contact with both pads.")
 
         if pinches == 0:
             print(
