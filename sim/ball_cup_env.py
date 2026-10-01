@@ -318,21 +318,48 @@ class BallCupEnv:
 
 
     def _is_pinched(self):
-        contacted_geoms = set()
+        required_pads = sorted(
+            (
+                self.fixed_finger_pad_geom,
+                self.moving_finger_pad_geom,
+            )
+        )
+        best_contact = {}
 
         for i in range(self.data.ncon):
             contact = self.data.contact[i]
 
             if self.ball_geom == contact.geom1:
-                contacted_geoms.add(int(contact.geom2))
+                pad_geom = int(contact.geom2)
             elif self.ball_geom == contact.geom2:
-                contacted_geoms.add(int(contact.geom1))
+                pad_geom = int(contact.geom1)
+            else:
+                continue
 
-        required_pads = {
-            self.fixed_finger_pad_geom,
-            self.moving_finger_pad_geom,
-        }
-        return required_pads.issubset(contacted_geoms)
+            if pad_geom not in required_pads:
+                continue
+
+            previous = best_contact.get(pad_geom)
+            if previous is None or contact.dist < previous[0]:
+                best_contact[pad_geom] = (
+                    float(contact.dist),
+                    contact.pos.copy(),
+                )
+
+        if not all(pad in best_contact for pad in required_pads):
+            return False
+
+        ball_center = self.data.xpos[self.ball_body]
+        directions = []
+
+        for pad in required_pads:
+            direction = best_contact[pad][1] - ball_center
+            length = np.linalg.norm(direction)
+            if length < 1e-8:
+                return False
+            directions.append(direction / length)
+
+        return float(np.dot(directions[0], directions[1])) <= -0.5
 
     def _is_grasped(self):
         ball_is_lifted = self.data.xpos[self.ball_body][2] > 0.035

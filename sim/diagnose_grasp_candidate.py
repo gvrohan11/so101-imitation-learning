@@ -253,7 +253,7 @@ def main():
                     f"normal={np.round(contact.frame[:3], 3)}"
                 )
 
-        pinched_after_close = pad_geoms.issubset(contacted_pads)
+        pinched_after_close = bool(env._is_pinched())
         ball_lift_reference = ball_after_close
         print(
             "  after close:",
