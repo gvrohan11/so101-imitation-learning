@@ -6,7 +6,7 @@ from sim.collision_check import JawTableCollisionChecker
 from sim.search_grasp_poses import main as search_safe_pinch_candidates
 
 # Keep the sweep bounded. Candidates are sorted by IK error by the search script.
-MAX_CANDIDATES = 20
+MAX_CANDIDATES = 1
 
 # The ball starts near z=0.020 m. Lift the gripper 25 mm so a successful
 # grasp has room to raise the ball above the required z=0.035 m threshold.
@@ -237,6 +237,21 @@ def main():
 
             if other_geom in pad_geoms:
                 contacted_pads.add(other_geom)
+
+                contact_force = np.zeros(6)
+                mujoco.mj_contactForce(
+                    model, data, contact_index, contact_force
+                )
+                pad_name = mujoco.mj_id2name(
+                    model, mujoco.mjtObj.mjOBJ_GEOM, other_geom
+                )
+                print(
+                    f"  pad contact {pad_name}: "
+                    f"distance={contact.dist:.6f} m, "
+                    f"normal_force={contact_force[0]:.4f} N, "
+                    f"point={np.round(contact.pos, 4)}, "
+                    f"normal={np.round(contact.frame[:3], 3)}"
+                )
 
         pinched_after_close = pad_geoms.issubset(contacted_pads)
         ball_lift_reference = ball_after_close
