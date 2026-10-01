@@ -36,8 +36,8 @@ def main():
 
         wrist_flex_range = model.jnt_range[joint_ids[3]]
         wrist_roll_range = model.jnt_range[joint_ids[4]]
-        wrist_flex_values = np.linspace(*wrist_flex_range, 5)
-        wrist_roll_values = np.linspace(*wrist_roll_range, 7)
+        wrist_flex_values = np.linspace(*wrist_flex_range, 9)
+        wrist_roll_values = np.linspace(*wrist_roll_range, 13)
 
         offsets = [
             np.array([dx, dy, dz])
