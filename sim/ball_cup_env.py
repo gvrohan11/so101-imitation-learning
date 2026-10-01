@@ -359,7 +359,7 @@ class BallCupEnv:
                 return False
             directions.append(direction / length)
 
-        return float(np.dot(directions[0], directions[1])) <= -0.5
+        return float(np.dot(directions[0], directions[1])) < 0.0
 
     def _is_grasped(self):
         ball_is_lifted = self.data.xpos[self.ball_body][2] > 0.035
