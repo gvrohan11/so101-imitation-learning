@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import os
+
 import mujoco
 import numpy as np
 from PIL import Image
@@ -8,22 +10,33 @@ from sim.ball_cup_env import JOINT_NAMES, BallCupEnv
 from sim.collision_check import JawTableCollisionChecker
 from sim.search_grasp_poses import main as search_safe_pinch_candidates
 
-# Keep the sweep bounded. Candidates are sorted by IK error by the search script.
-MAX_CANDIDATES = 20
+# Test the best static lower-contact candidate selected by the pose search.
+MAX_CANDIDATES = 1
+DIAGNOSTIC_SEED = int(os.environ.get("SO101_GRASP_SEED", "0"))
 
 # The ball starts near z=0.020 m. Lift the gripper 25 mm so a successful
 # grasp has room to raise the ball above the required z=0.035 m threshold.
 LIFT_METERS = 0.025
 LIFT_WAYPOINTS = 25
-FRAMES_PER_LIFT_WAYPOINT = 7
+FRAMES_PER_LIFT_WAYPOINT = 30
 
 # Abort an approach if it pushes the ball too far.
 MAX_APPROACH_BALL_SHIFT = 0.012  # meters
+MAX_LIFT_LATERAL_SHIFT = 0.025  # meters
 APPROACH_CLEARANCE_METERS = 0.08
 APPROACH_WAYPOINTS = 20
 MIN_FRAMES_PER_APPROACH_WAYPOINT = 50
 RADIANS_PER_APPROACH_FRAME = 0.009
 MAX_WAYPOINT_SETTLE_FRAMES = 200
+PINCH_COMPRESSION_FRAMES = 40
+PINCH_PRELOAD_RADIANS = 0.06
+PINCH_SETTLE_FRAMES = 300
+RECORD_CANDIDATE_VIDEO = (
+    os.environ.get("SO101_RECORD_CANDIDATE_VIDEO", "0") == "1"
+)
+VIDEO_CANDIDATE_INDEX = int(
+    os.environ.get("SO101_VIDEO_CANDIDATE_INDEX", "1")
+)
 
 
 def main():
@@ -63,15 +76,39 @@ def main():
     def ball_position():
         return data.xpos[env.ball_body].copy()
 
-    def move_to(target_positions, frame_count, stage, ball_start, capture):
-        """Interpolate joint targets and stop on collision or excessive ball shift."""
+    def move_to(
+        target_positions,
+        frame_count,
+        stage,
+        ball_start,
+        capture,
+        stop_when_pinched=False,
+    ):
+        """Move to a pose, freezing the jaw at first stable pinch contact."""
         start_positions = data.qpos[qpos_ids].copy()
+        pinch_frame = None
+        pinch_start_positions = None
+        initial_frame_count = frame_count
+        frame = 0
 
-        for frame in range(frame_count):
-            fraction = (frame + 1) / frame_count
-            commanded = start_positions + fraction * (
-                target_positions - start_positions
-            )
+        while frame < frame_count:
+            if pinch_start_positions is None:
+                fraction = (frame + 1) / initial_frame_count
+                commanded = start_positions + fraction * (
+                    target_positions - start_positions
+                )
+            else:
+                preload_fraction = min(
+                    (frame + 1 - pinch_frame) / PINCH_COMPRESSION_FRAMES,
+                    1.0,
+                )
+                # Continue to the statically validated first-contact target.
+                # Holding the measured joint angle here lets the position
+                # actuator relax open while the jaw is still moving.
+                commanded = target_positions.copy()
+                commanded[-1] -= (
+                    preload_fraction * PINCH_PRELOAD_RADIANS
+                )
             observation, _, terminated, truncated, _ = env.step(
                 action_for(commanded)
             )
@@ -129,9 +166,59 @@ def main():
                     )
                 return False
 
+            if stop_when_pinched:
+                currently_pinched = env._is_pinched()
+                if currently_pinched and pinch_frame is None:
+                    pinch_frame = frame + 1
+                    pinch_start_positions = actual.copy()
+                    frame_count = max(
+                        frame_count,
+                        pinch_frame + PINCH_COMPRESSION_FRAMES,
+                    )
+                    print(
+                        f"  two-finger pinch detected after {pinch_frame} "
+                        "close frames; "
+                        f"q={actual[-1]:.4f}, "
+                        f"target={commanded[-1]:.4f}, "
+                        f"qvel={data.qvel[dof_ids[-1]]:.4f}; "
+                        "continuing to the pinch target"
+                    )
+                elif pinch_frame is not None and not currently_pinched:
+                    print("  abort: pinch was lost while holding contact")
+                    print(
+                        "  closure slip state: ball=",
+                        np.round(ball_position(), 5),
+                        "jaw=",
+                        np.round(data.qpos[qpos_ids], 4),
+                    )
+                    for contact_index in range(data.ncon):
+                        contact = data.contact[contact_index]
+                        pair = {int(contact.geom1), int(contact.geom2)}
+                        if env.ball_geom in pair and pair.intersection(
+                            {env.fixed_finger_geom, env.moving_finger_geom}
+                        ):
+                            print(
+                                "  closure contact:",
+                                np.round(contact.pos, 5),
+                                "distance=",
+                                round(float(contact.dist), 6),
+                            )
+                    return False
+                elif (
+                    pinch_frame is not None
+                    and frame + 1 - pinch_frame >= PINCH_COMPRESSION_FRAMES
+                ):
+                    print(
+                        "  completed pinch preload over frames:",
+                        PINCH_COMPRESSION_FRAMES,
+                    )
+                    return True
+
             if terminated or truncated:
                 print(f"  abort: episode ended during {stage}")
                 return False
+
+            frame += 1
 
         error = float(
             np.max(np.abs(data.qpos[qpos_ids] - target_positions))
@@ -176,36 +263,94 @@ def main():
             return False
         return True
 
+    def rotation_vector(target_rotation, current_rotation):
+        relative = target_rotation @ current_rotation.T
+        cosine = np.clip((np.trace(relative) - 1.0) * 0.5, -1.0, 1.0)
+        angle = float(np.arccos(cosine))
+        skew = np.array(
+            [
+                relative[2, 1] - relative[1, 2],
+                relative[0, 2] - relative[2, 0],
+                relative[1, 0] - relative[0, 1],
+            ]
+        )
+        if angle < 1e-7:
+            return 0.5 * skew
+        return (angle / (2.0 * np.sin(angle))) * skew
+
     def solve_cartesian_waypoint(
-        target_xyz, seed_positions, fixed_wrist_gripper
+        target_xyz,
+        seed_positions,
+        fixed_wrist_gripper,
+        target_rotation=None,
+        target_axis=None,
     ):
-        """Solve Cartesian XYZ while holding wrist and gripper joints fixed."""
+        """Solve XYZ, optionally preserving the gripper's world orientation."""
         saved_qpos = data.qpos.copy()
         data.qpos[qpos_ids] = seed_positions
-        data.qpos[qpos_ids[3:6]] = fixed_wrist_gripper
+        if target_rotation is None:
+            data.qpos[qpos_ids[3:6]] = fixed_wrist_gripper
+        else:
+            data.qpos[qpos_ids[5]] = fixed_wrist_gripper[2]
 
         try:
             for _ in range(150):
                 mujoco.mj_forward(model, data)
                 error = target_xyz - data.site_xpos[env.gripper_site]
-                if np.linalg.norm(error) < 0.001:
-                    break
-
                 jac_pos = np.zeros((3, model.nv))
                 jac_rot = np.zeros((3, model.nv))
                 mujoco.mj_jacSite(
                     model, data, jac_pos, jac_rot, env.gripper_site
                 )
-                jac = jac_pos[:, dof_ids[:3]]
-                delta = jac.T @ np.linalg.solve(
-                    jac @ jac.T + 0.05**2 * np.eye(3), error
-                )
+                if target_rotation is None:
+                    if np.linalg.norm(error) < 0.001:
+                        break
+                    jac = jac_pos[:, dof_ids[:3]]
+                    delta = jac.T @ np.linalg.solve(
+                        jac @ jac.T + 0.05**2 * np.eye(3), error
+                    )
+                    controlled_joint_count = 3
+                else:
+                    rotation_error = rotation_vector(
+                        target_rotation,
+                        data.site_xmat[env.gripper_site].reshape(3, 3),
+                    )
+                    rotation_projector = np.eye(3)
+                    if target_axis is not None:
+                        rotation_projector -= np.outer(
+                            target_axis, target_axis
+                        )
+                    rotation_error = rotation_projector @ rotation_error
+                    if (
+                        np.linalg.norm(error) < 0.001
+                        and np.linalg.norm(rotation_error) < 0.01
+                    ):
+                        break
+
+                    rotation_weight = 0.08
+                    task_jacobian = np.vstack(
+                        (
+                            jac_pos[:, dof_ids[:5]],
+                            rotation_weight
+                            * rotation_projector
+                            @ jac_rot[:, dof_ids[:5]],
+                        )
+                    )
+                    task_error = np.concatenate(
+                        (error, rotation_weight * rotation_error)
+                    )
+                    delta = task_jacobian.T @ np.linalg.solve(
+                        task_jacobian @ task_jacobian.T
+                        + 0.05**2 * np.eye(6),
+                        task_error,
+                    )
+                    controlled_joint_count = 5
 
                 length = np.linalg.norm(delta)
                 if length > 0.05:
                     delta *= 0.05 / length
 
-                for joint_index in range(3):
+                for joint_index in range(controlled_joint_count):
                     qpos_index = qpos_ids[joint_index]
                     joint_id = mujoco.mj_name2id(
                         model,
@@ -221,11 +366,29 @@ def main():
 
             mujoco.mj_forward(model, data)
             solution = data.qpos[qpos_ids].copy()
-            residual = float(
-                np.linalg.norm(
-                    target_xyz - data.site_xpos[env.gripper_site]
-                )
+            position_residual = np.linalg.norm(
+                target_xyz - data.site_xpos[env.gripper_site]
             )
+            if target_rotation is None:
+                residual = float(position_residual)
+            else:
+                orientation_residual = np.linalg.norm(
+                    rotation_vector(
+                        target_rotation,
+                        data.site_xmat[env.gripper_site].reshape(3, 3),
+                    )
+                )
+                if target_axis is not None:
+                    orientation_residual = np.linalg.norm(
+                        (np.eye(3) - np.outer(target_axis, target_axis))
+                        @ rotation_vector(
+                            target_rotation,
+                            data.site_xmat[env.gripper_site].reshape(3, 3),
+                        )
+                    )
+                residual = float(
+                    max(position_residual, 0.08 * orientation_residual)
+                )
             return solution, residual
         finally:
             data.qpos[:] = saved_qpos
@@ -240,20 +403,30 @@ def main():
             pregrasp_q,
             contact_open_q,
             contact_closed_q,
+            contact_opposition,
+            contact_heights,
         ) = candidate
 
         # Candidate poses were searched using seed 0, so reset to seed 0 for
         # every attempt: same scene, fresh simulation state.
-        if candidate_index == 11 and env.renderer is None:
+        if (
+            candidate_index == VIDEO_CANDIDATE_INDEX
+            and RECORD_CANDIDATE_VIDEO
+            and env.renderer is None
+        ):
             env.renderer = mujoco.Renderer(model, height=224, width=224)
 
-        observation, _ = env.reset(seed=0)
+        observation, _ = env.reset(seed=DIAGNOSTIC_SEED)
         frames = []
         captured_steps = 0
 
         def capture(observation):
             nonlocal captured_steps
-            if candidate_index != 11 or observation["image"] is None:
+            if (
+                candidate_index != VIDEO_CANDIDATE_INDEX
+                or not RECORD_CANDIDATE_VIDEO
+                or observation["image"] is None
+            ):
                 return
             captured_steps += 1
             if captured_steps % 5 == 0 or not frames:
@@ -268,7 +441,9 @@ def main():
             f"wrist_flex={wrist_flex:+.3f}, "
             f"wrist_roll={wrist_roll:+.3f}, "
             f"offset={np.round(offset, 3)}, "
-            f"IK error sum={total_error * 1000:.1f} mm"
+            f"IK error sum={total_error * 1000:.1f} mm, "
+            f"static contact opposition={contact_opposition:.3f}, "
+            f"contact z offsets={np.round(contact_heights, 4)}"
         )
         print("  ball start:", np.round(ball_start, 4))
 
@@ -291,6 +466,12 @@ def main():
                 (ball_end[2] - ball_lift_reference[2]) * 1000.0
             )
             result["ball_z"] = float(ball_end[2])
+
+        start_q = data.qpos[qpos_ids].copy()
+        if not checker.candidate_is_safe(contact_open_q, contact_closed_q):
+            result["reason"] = "closing path failed collision check"
+            record_metrics()
+            return result
 
         def move_cartesian_path(
             start_xyz,
@@ -323,7 +504,9 @@ def main():
                 if not checker.candidate_is_safe(actual_start, waypoint_q):
                     print(
                         f"  abort: jaw/table path check failed during "
-                        f"{stage} at waypoint {waypoint_index}"
+                        f"{stage} at waypoint {waypoint_index}; "
+                        f"contact={checker.last_collision}, "
+                        f"q={np.round(checker.last_collision_qpos, 4) if checker.last_collision_qpos is not None else None}"
                     )
                     return False
                 max_joint_change = float(
@@ -345,21 +528,15 @@ def main():
                     return False
             return True
 
-        start_q = data.qpos[qpos_ids].copy()
-        if not checker.candidate_is_safe(contact_open_q, contact_closed_q):
-            result["reason"] = "closing path failed collision check"
-            record_metrics()
-            return result
-
         fixed_open_wrist_gripper = pregrasp_q[3:6].copy()
         reset_wrist_gripper = data.qpos[qpos_ids[3:6]].copy()
         start_site = data.site_xpos[env.gripper_site].copy()
         vertical_clearance = start_site + np.array(
             [0.0, 0.0, APPROACH_CLEARANCE_METERS]
         )
-        pregrasp_xyz = ball_start + offset + np.array([0.0, 0.0, 0.06])
         contact_xyz = ball_start + offset
-        transit_xyz = pregrasp_xyz + np.array([0.0, 0.0, 0.06])
+        side_approach_xyz = contact_xyz + np.array([0.0, 0.05, 0.0])
+        transit_xyz = side_approach_xyz + np.array([0.0, 0.0, 0.06])
         transit_xyz[2] = max(transit_xyz[2], vertical_clearance[2])
 
         if not move_cartesian_path(
@@ -387,10 +564,10 @@ def main():
         current_site = data.site_xpos[env.gripper_site].copy()
         if not move_cartesian_path(
             current_site,
-            pregrasp_xyz,
+            side_approach_xyz,
             fixed_open_wrist_gripper,
             APPROACH_WAYPOINTS,
-            "descent to pregrasp",
+            "descent beside ball",
         ):
             result["reason"] = "pregrasp descent failed"
             record_metrics()
@@ -398,26 +575,57 @@ def main():
         current_site = data.site_xpos[env.gripper_site].copy()
         if not move_cartesian_path(
             current_site,
+            side_approach_xyz,
+            contact_open_q[3:6],
+            1,
+            "pre-close beside ball",
+            start_wrist_gripper=fixed_open_wrist_gripper,
+        ):
+            result["reason"] = "side pre-close failed"
+            record_metrics()
+            return result
+        current_site = data.site_xpos[env.gripper_site].copy()
+        if not move_cartesian_path(
+            current_site,
             contact_xyz,
-            fixed_open_wrist_gripper,
+            contact_open_q[3:6],
             APPROACH_WAYPOINTS,
-            "open-jaw descent to contact",
+            "horizontal open-jaw approach",
         ):
             result["reason"] = "contact descent failed"
             record_metrics()
             return result
+        print(
+            "  at contact before closure: ball=",
+            np.round(ball_position(), 5),
+            "site=",
+            np.round(data.site_xpos[env.gripper_site], 5),
+            "fixed_tip=",
+            np.round(data.geom_xpos[env.fixed_finger_geom], 5),
+            "moving_tip=",
+            np.round(data.geom_xpos[env.moving_finger_geom], 5),
+        )
         if not move_to(
-            contact_closed_q, 300, "gripper close", ball_start, capture
+            contact_closed_q,
+            300,
+            "gripper close",
+            ball_start,
+            capture,
+            stop_when_pinched=True,
         ):
             result["reason"] = "closing motion failed"
             record_metrics()
             return result
 
+        contact_closed_q = data.qpos[qpos_ids].copy()
+        # The ball can stop the jaw before its requested preload angle. Keep
+        # the actuator target so the gripper continues pressing during lift.
+        contact_closed_q[-1] = data.ctrl[env.actuator_ids[-1]]
         ball_after_close = ball_position()
-        fixed_pad_geom = env.fixed_finger_pad_geom
-        moving_pad_geom = env.moving_finger_pad_geom
-        pad_geoms = {fixed_pad_geom, moving_pad_geom}
-        contacted_pads = set()
+        fixed_finger_geom = env.fixed_finger_geom
+        moving_finger_geom = env.moving_finger_geom
+        finger_geoms = {fixed_finger_geom, moving_finger_geom}
+        contacted_fingers = set()
 
         for contact_index in range(data.ncon):
             contact = data.contact[contact_index]
@@ -429,22 +637,27 @@ def main():
             else:
                 continue
 
-            if other_geom in pad_geoms:
-                contacted_pads.add(other_geom)
+            if other_geom in finger_geoms:
+                contacted_fingers.add(other_geom)
 
                 contact_force = np.zeros(6)
                 mujoco.mj_contactForce(
                     model, data, contact_index, contact_force
                 )
-                pad_name = mujoco.mj_id2name(
+                contact_rotation = contact.frame.reshape(3, 3)
+                world_contact_force = contact_rotation.T @ contact_force[:3]
+                finger_name = mujoco.mj_id2name(
                     model, mujoco.mjtObj.mjOBJ_GEOM, other_geom
                 )
                 print(
-                    f"  pad contact {pad_name}: "
+                    f"  finger-mesh contact {finger_name}: "
                     f"distance={contact.dist:.6f} m, "
                     f"normal_force={contact_force[0]:.4f} N, "
                     f"point={np.round(contact.pos, 4)}, "
-                    f"normal={np.round(contact.frame[:3], 3)}"
+                    f"normal={np.round(contact.frame[:3], 3)}, "
+                    f"world_force_on_ball={np.round(world_contact_force, 4)}, "
+                    f"pair=({mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, int(contact.geom1))}, "
+                    f"{mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, int(contact.geom2))})"
                 )
 
         pinched_after_close = bool(env._is_pinched())
@@ -454,14 +667,118 @@ def main():
             f"pinched={pinched_after_close}",
             f"ball={np.round(ball_after_close, 4)}",
         )
+        print(
+            "  ball velocity/acceleration:",
+            np.round(data.qvel[env.ball_qvel:env.ball_qvel + 3], 5),
+            np.round(data.qacc[env.ball_qvel:env.ball_qvel + 3], 4),
+        )
+        print(
+            "  ball constraint force:",
+            np.round(data.qfrc_constraint[env.ball_qvel:env.ball_qvel + 3], 5),
+        )
+        table_geom = mujoco.mj_name2id(
+            model, mujoco.mjtObj.mjOBJ_GEOM, "table_top"
+        )
+        for contact_index in range(data.ncon):
+            contact = data.contact[contact_index]
+            pair = {int(contact.geom1), int(contact.geom2)}
+            if env.ball_geom in pair and table_geom in pair:
+                force = np.zeros(6)
+                mujoco.mj_contactForce(model, data, contact_index, force)
+                print(
+                    "  ball/table contact:",
+                    "distance=",
+                    round(float(contact.dist), 6),
+                    "normal_force=",
+                    round(float(force[0]), 5),
+                )
 
         if not pinched_after_close:
             result["reason"] = "no two-jaw pinch after closing"
             record_metrics()
             return result
 
+        if not move_to(
+            contact_closed_q,
+            PINCH_SETTLE_FRAMES,
+            "pinch settle",
+            ball_start,
+            capture,
+        ):
+            result["reason"] = "pinch did not settle before lift"
+            record_metrics()
+            return result
+        print(
+            "  after pinch settle: ball=",
+            np.round(ball_position(), 5),
+            "velocity=",
+            np.round(data.qvel[env.ball_qvel:env.ball_qvel + 3], 5),
+        )
+
         lift_start_site = data.site_xpos[env.gripper_site].copy()
         fixed_wrist_gripper = contact_closed_q[3:6].copy()
+        target_gripper_rotation = data.site_xmat[env.gripper_site].reshape(
+            3, 3
+        ).copy()
+        fixed_contact = next(
+            data.contact[index].pos.copy()
+            for index in range(data.ncon)
+            if env.ball_geom in (
+                data.contact[index].geom1,
+                data.contact[index].geom2,
+            )
+            and env.fixed_finger_geom in (
+                data.contact[index].geom1,
+                data.contact[index].geom2,
+            )
+        )
+        moving_contact = next(
+            data.contact[index].pos.copy()
+            for index in range(data.ncon)
+            if env.ball_geom in (
+                data.contact[index].geom1,
+                data.contact[index].geom2,
+            )
+            and env.moving_finger_geom in (
+                data.contact[index].geom1,
+                data.contact[index].geom2,
+            )
+        )
+        jaw_axis = fixed_contact - moving_contact
+        jaw_axis /= np.linalg.norm(jaw_axis)
+        horizontal_jaw_axis = jaw_axis.copy()
+        horizontal_jaw_axis[2] = 0.0
+        horizontal_jaw_axis /= np.linalg.norm(horizontal_jaw_axis)
+        alignment_axis = np.cross(jaw_axis, horizontal_jaw_axis)
+        alignment_sine = np.linalg.norm(alignment_axis)
+        alignment_cosine = float(np.clip(jaw_axis @ horizontal_jaw_axis, -1, 1))
+        if alignment_sine > 1e-8:
+            alignment_axis /= alignment_sine
+            skew = np.array(
+                [
+                    [0.0, -alignment_axis[2], alignment_axis[1]],
+                    [alignment_axis[2], 0.0, -alignment_axis[0]],
+                    [-alignment_axis[1], alignment_axis[0], 0.0],
+                ]
+            )
+            alignment = (
+                np.eye(3)
+                + alignment_sine * skew
+                + (1.0 - alignment_cosine) * (skew @ skew)
+            )
+            target_gripper_rotation = alignment @ target_gripper_rotation
+        fixed_pad_axis = data.geom_xmat[env.fixed_finger_geom].reshape(
+            3, 3
+        )[:, 2]
+        moving_pad_axis = data.geom_xmat[env.moving_finger_geom].reshape(
+            3, 3
+        )[:, 2]
+        print(
+            "  world jaw/fixed-pad/moving-pad axes:",
+            np.round(jaw_axis, 4),
+            np.round(fixed_pad_axis, 4),
+            np.round(moving_pad_axis, 4),
+        )
         pinch_persisted = True
         lift_aborted = False
 
@@ -471,7 +788,11 @@ def main():
             )
             actual_start = data.qpos[qpos_ids].copy()
             waypoint_q, ik_error = solve_cartesian_waypoint(
-                target_xyz, actual_start, fixed_wrist_gripper
+                target_xyz,
+                actual_start,
+                fixed_wrist_gripper,
+                target_rotation=target_gripper_rotation,
+                target_axis=horizontal_jaw_axis,
             )
 
             if ik_error > 0.003:
@@ -513,6 +834,35 @@ def main():
                         f"  pinch lost at lift waypoint {waypoint_index}, "
                         f"substep {substep}"
                     )
+                    print(
+                        "  slip state: ball=",
+                        np.round(ball_position(), 5),
+                        "jaw=",
+                        np.round(data.qpos[qpos_ids], 4),
+                        "site=",
+                        np.round(data.site_xpos[env.gripper_site], 5),
+                        "target=",
+                        np.round(target_xyz, 5),
+                    )
+                    for contact_index in range(data.ncon):
+                        contact = data.contact[contact_index]
+                        pair = {int(contact.geom1), int(contact.geom2)}
+                        if env.ball_geom not in pair or not pair.intersection(
+                            finger_geoms
+                        ):
+                            continue
+                        force = np.zeros(6)
+                        mujoco.mj_contactForce(
+                            model, data, contact_index, force
+                        )
+                        print(
+                            "  slip contact:",
+                            np.round(contact.pos, 5),
+                            "distance=",
+                            round(float(contact.dist), 6),
+                            "force(normal, tangent)=",
+                            np.round(force[:3], 5),
+                        )
                     result["reason"] = "two-jaw pinch lost during lift"
                     pinch_persisted = False
                     lift_aborted = True
@@ -527,7 +877,12 @@ def main():
                 lateral_shift = np.linalg.norm(
                     ball_now[:2] - ball_after_close[:2]
                 )
-                if lateral_shift > MAX_APPROACH_BALL_SHIFT:
+                if lateral_shift > MAX_LIFT_LATERAL_SHIFT:
+                    print(
+                        f"  abort: lateral ball shift during lift="
+                        f"{lateral_shift * 1000:.1f} mm at waypoint "
+                        f"{waypoint_index}, substep {substep}"
+                    )
                     result["reason"] = "ball slid sideways during lift"
                     lift_aborted = True
                     break
@@ -550,8 +905,14 @@ def main():
             and env._is_pinched()
             and ball_end[2] > 0.035
         )
-        if candidate_index == 11 and result["success"] and frames:
-            output = Path("results/candidate11_grasp_lift.gif")
+        if (
+            candidate_index == VIDEO_CANDIDATE_INDEX
+            and RECORD_CANDIDATE_VIDEO
+            and frames
+        ):
+            output = Path(
+                f"results/finger_mesh_candidate_{candidate_index:02d}.gif"
+            )
             output.parent.mkdir(parents=True, exist_ok=True)
             images = [Image.fromarray(frame) for frame in frames]
             images[0].save(

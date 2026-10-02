@@ -12,6 +12,11 @@ JOINT_NAMES = (
     "gripper"
 )
 
+MIN_HORIZONTAL_PINCH_OPPOSITION = -0.40
+MAX_PINCH_CONTACT_VERTICAL_COMPONENT = 0.65
+MIN_UPWARD_PINCH_COMPONENT = 0.10
+MAX_PINCH_PENETRATION = 0.004
+
 class BallCupEnv:
     def __init__(
         self,
@@ -61,11 +66,11 @@ class BallCupEnv:
         self.ball_qvel = self.model.jnt_dofadr[self.ball_joint]
         self.ball_body = get_id(mujoco.mjtObj.mjOBJ_BODY, "ball")
         self.ball_geom = get_id(mujoco.mjtObj.mjOBJ_GEOM, "ball_geom")
-        self.fixed_finger_pad_geom = get_id(
-            mujoco.mjtObj.mjOBJ_GEOM, "fixed_finger_pad"
+        self.fixed_finger_geom = get_id(
+            mujoco.mjtObj.mjOBJ_GEOM, "fixed_finger_collision"
         )
-        self.moving_finger_pad_geom = get_id(
-            mujoco.mjtObj.mjOBJ_GEOM, "moving_finger_pad"
+        self.moving_finger_geom = get_id(
+            mujoco.mjtObj.mjOBJ_GEOM, "moving_finger_collision"
         )
         self.cup_body = get_id(mujoco.mjtObj.mjOBJ_BODY, "cup")
 
@@ -323,10 +328,10 @@ class BallCupEnv:
 
 
     def _is_pinched(self):
-        required_pads = sorted(
+        required_fingers = sorted(
             (
-                self.fixed_finger_pad_geom,
-                self.moving_finger_pad_geom,
+                self.fixed_finger_geom,
+                self.moving_finger_geom,
             )
         )
         best_contact = {}
@@ -335,36 +340,60 @@ class BallCupEnv:
             contact = self.data.contact[i]
 
             if self.ball_geom == contact.geom1:
-                pad_geom = int(contact.geom2)
+                finger_geom = int(contact.geom2)
             elif self.ball_geom == contact.geom2:
-                pad_geom = int(contact.geom1)
+                finger_geom = int(contact.geom1)
             else:
                 continue
 
-            if pad_geom not in required_pads:
+            if finger_geom not in required_fingers:
                 continue
 
-            previous = best_contact.get(pad_geom)
+            previous = best_contact.get(finger_geom)
             if previous is None or contact.dist < previous[0]:
-                best_contact[pad_geom] = (
+                best_contact[finger_geom] = (
                     float(contact.dist),
                     contact.pos.copy(),
                 )
 
-        if not all(pad in best_contact for pad in required_pads):
+        if not all(finger in best_contact for finger in required_fingers):
+            return False
+
+        if any(
+            best_contact[finger][0] < -MAX_PINCH_PENETRATION
+            for finger in required_fingers
+        ):
             return False
 
         ball_center = self.data.xpos[self.ball_body]
         directions = []
 
-        for pad in required_pads:
-            direction = best_contact[pad][1] - ball_center
+        for finger in required_fingers:
+            direction = best_contact[finger][1] - ball_center
             length = np.linalg.norm(direction)
             if length < 1e-8:
                 return False
             directions.append(direction / length)
 
-        return float(np.dot(directions[0], directions[1])) < 0.0
+        # The jaw normals must oppose horizontally and point up the ball's
+        # lower hemisphere so they can support it during the lift.
+        horizontal = []
+        for direction in directions:
+            horizontal_direction = direction[:2]
+            horizontal_length = np.linalg.norm(horizontal_direction)
+            if (
+                direction[2] >= -MIN_UPWARD_PINCH_COMPONENT
+                or abs(float(direction[2]))
+                > MAX_PINCH_CONTACT_VERTICAL_COMPONENT
+                or horizontal_length < 1e-8
+            ):
+                return False
+            horizontal.append(horizontal_direction / horizontal_length)
+
+        return (
+            float(np.dot(horizontal[0], horizontal[1]))
+            <= MIN_HORIZONTAL_PINCH_OPPOSITION
+        )
 
     def _is_grasped(self):
         ball_is_lifted = self.data.xpos[self.ball_body][2] > 0.035

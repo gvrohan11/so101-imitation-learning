@@ -17,6 +17,9 @@ class JawTableCollisionChecker:
             [env.joint_qpos[name] for name in JOINT_NAMES], dtype=np.int32
         )
         self.moving_jaw_body = env.moving_jaw_body
+        self.moving_finger_geom = env.moving_finger_geom
+        self.last_collision = None
+        self.last_collision_qpos = None
         self.table_geom = mujoco.mj_name2id(
             self.model, mujoco.mjtObj.mjOBJ_GEOM, "table_top"
         )
@@ -33,6 +36,8 @@ class JawTableCollisionChecker:
             raise ValueError("Joint positions contain NaN or infinity")
 
         saved_qpos = self.data.qpos.copy()
+        self.last_collision = None
+        self.last_collision_qpos = None
         try:
             self.data.qpos[self.joint_qpos] = qpos
             mujoco.mj_forward(self.model, self.data)
@@ -47,10 +52,33 @@ class JawTableCollisionChecker:
                     continue
 
                 other_body = int(self.model.geom_bodyid[other_geom])
-                if (
-                    other_body == self.moving_jaw_body
-                    and contact.dist <= 0.0
-                ):
+                if other_body != self.moving_jaw_body:
+                    continue
+
+                # The fingertip pad may lightly brush the tabletop while it
+                # closes around a ball resting on the surface. Reject a real
+                # penetration, but do not reject an otherwise valid grasp for
+                # a tiny solver overlap at the pad's rounded end.
+                if other_geom == self.moving_finger_geom:
+                    if contact.dist < -0.001:
+                        self.last_collision = (
+                            mujoco.mj_id2name(
+                                self.model,
+                                mujoco.mjtObj.mjOBJ_GEOM,
+                                other_geom,
+                            ),
+                            float(contact.dist),
+                        )
+                        self.last_collision_qpos = qpos.copy()
+                        return True
+                elif contact.dist <= 0.0:
+                    self.last_collision = (
+                        mujoco.mj_id2name(
+                            self.model, mujoco.mjtObj.mjOBJ_GEOM, other_geom
+                        ),
+                        float(contact.dist),
+                    )
+                    self.last_collision_qpos = qpos.copy()
                     return True
             return False
         finally:
