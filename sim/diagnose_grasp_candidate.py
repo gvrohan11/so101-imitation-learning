@@ -1,5 +1,8 @@
+from pathlib import Path
+
 import mujoco
 import numpy as np
+from PIL import Image
 
 from sim.ball_cup_env import JOINT_NAMES, BallCupEnv
 from sim.collision_check import JawTableCollisionChecker
@@ -60,7 +63,7 @@ def main():
     def ball_position():
         return data.xpos[env.ball_body].copy()
 
-    def move_to(target_positions, frame_count, stage, ball_start):
+    def move_to(target_positions, frame_count, stage, ball_start, capture):
         """Interpolate joint targets and stop on collision or excessive ball shift."""
         start_positions = data.qpos[qpos_ids].copy()
 
@@ -69,7 +72,10 @@ def main():
             commanded = start_positions + fraction * (
                 target_positions - start_positions
             )
-            _, _, terminated, truncated, _ = env.step(action_for(commanded))
+            observation, _, terminated, truncated, _ = env.step(
+                action_for(commanded)
+            )
+            capture(observation)
 
             actual = data.qpos[qpos_ids].copy()
             if not checker.pose_is_collision_free(actual):
@@ -135,9 +141,10 @@ def main():
             error > 0.03
             and settle_frames < MAX_WAYPOINT_SETTLE_FRAMES
         ):
-            _, _, terminated, truncated, _ = env.step(
+            observation, _, terminated, truncated, _ = env.step(
                 action_for(target_positions)
             )
+            capture(observation)
             settle_frames += 1
 
             actual = data.qpos[qpos_ids].copy()
@@ -237,7 +244,22 @@ def main():
 
         # Candidate poses were searched using seed 0, so reset to seed 0 for
         # every attempt: same scene, fresh simulation state.
-        env.reset(seed=0)
+        if candidate_index == 11 and env.renderer is None:
+            env.renderer = mujoco.Renderer(model, height=224, width=224)
+
+        observation, _ = env.reset(seed=0)
+        frames = []
+        captured_steps = 0
+
+        def capture(observation):
+            nonlocal captured_steps
+            if candidate_index != 11 or observation["image"] is None:
+                return
+            captured_steps += 1
+            if captured_steps % 5 == 0 or not frames:
+                frames.append(observation["image"].copy())
+
+        capture(observation)
         mujoco.mj_forward(model, data)
         ball_start = ball_position()
 
@@ -318,6 +340,7 @@ def main():
                     frame_count,
                     f"{stage} waypoint {waypoint_index}",
                     ball_start,
+                    capture,
                 ):
                     return False
             return True
@@ -383,7 +406,9 @@ def main():
             result["reason"] = "contact descent failed"
             record_metrics()
             return result
-        if not move_to(contact_closed_q, 300, "gripper close", ball_start):
+        if not move_to(
+            contact_closed_q, 300, "gripper close", ball_start, capture
+        ):
             result["reason"] = "closing motion failed"
             record_metrics()
             return result
@@ -472,9 +497,10 @@ def main():
                 commanded = actual_start + fraction * (
                     waypoint_q - actual_start
                 )
-                _, _, terminated, truncated, _ = env.step(
+                observation, _, terminated, truncated, _ = env.step(
                     action_for(commanded)
                 )
+                capture(observation)
 
                 if not checker.pose_is_collision_free(data.qpos[qpos_ids]):
                     result["reason"] = "jaw/table collision during lift"
@@ -524,6 +550,18 @@ def main():
             and env._is_pinched()
             and ball_end[2] > 0.035
         )
+        if candidate_index == 11 and result["success"] and frames:
+            output = Path("results/candidate11_grasp_lift.gif")
+            output.parent.mkdir(parents=True, exist_ok=True)
+            images = [Image.fromarray(frame) for frame in frames]
+            images[0].save(
+                output,
+                save_all=True,
+                append_images=images[1:],
+                duration=50,
+                loop=0,
+            )
+            print("Saved video:", output.resolve())
         if result["success"]:
             result["reason"] = "passed: pinch persisted and ball rose above 0.035 m"
         elif result["reason"] == "not completed":
