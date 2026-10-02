@@ -150,6 +150,11 @@ class BallCupEnv:
 
         mujoco.mj_resetData(self.model, self.data)
 
+        gripper_actuator = self.actuator_ids[-1]
+        open_angle = self.model.actuator_ctrlrange[gripper_actuator, 1]
+        self.data.qpos[self.joint_qpos["gripper"]] = open_angle
+        self.data.ctrl[gripper_actuator] = open_angle
+
         # Small randomized cup and ball positions, both on the tabletop.
         cup_x = self.rng.uniform(0.23, 0.27)
         cup_y = self.rng.uniform(0.11, 0.15)

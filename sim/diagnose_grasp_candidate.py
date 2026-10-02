@@ -6,7 +6,7 @@ from sim.collision_check import JawTableCollisionChecker
 from sim.search_grasp_poses import main as search_safe_pinch_candidates
 
 # Keep the sweep bounded. Candidates are sorted by IK error by the search script.
-MAX_CANDIDATES = 1
+MAX_CANDIDATES = 20
 
 # The ball starts near z=0.020 m. Lift the gripper 25 mm so a successful
 # grasp has room to raise the ball above the required z=0.035 m threshold.
@@ -16,6 +16,11 @@ FRAMES_PER_LIFT_WAYPOINT = 7
 
 # Abort an approach if it pushes the ball too far.
 MAX_APPROACH_BALL_SHIFT = 0.012  # meters
+APPROACH_CLEARANCE_METERS = 0.08
+APPROACH_WAYPOINTS = 20
+MIN_FRAMES_PER_APPROACH_WAYPOINT = 50
+RADIANS_PER_APPROACH_FRAME = 0.009
+MAX_WAYPOINT_SETTLE_FRAMES = 200
 
 
 def main():
@@ -27,7 +32,7 @@ def main():
     candidates = candidates[:MAX_CANDIDATES]
     print(f"\nDynamically testing {len(candidates)} candidates")
 
-    env = BallCupEnv(render_images=False, frame_skip=1, horizon=5000)
+    env = BallCupEnv(render_images=False, frame_skip=1, horizon=10000)
     model, data = env.model, env.data
     qpos_ids = np.array(
         [env.joint_qpos[name] for name in JOINT_NAMES], dtype=np.int32
@@ -77,20 +82,97 @@ def main():
                     f"  abort: ball shifted {shift * 1000:.1f} mm "
                     f"during {stage}"
                 )
+                for contact_index in range(data.ncon):
+                    contact = data.contact[contact_index]
+                    if env.ball_geom not in (
+                        contact.geom1, contact.geom2
+                    ):
+                        continue
+
+                    other_geom = (
+                        int(contact.geom2)
+                        if contact.geom1 == env.ball_geom
+                        else int(contact.geom1)
+                    )
+                    contact_force = np.zeros(6, dtype=np.float64)
+                    mujoco.mj_contactForce(
+                        model, data, contact_index, contact_force
+                    )
+                    other_body = int(model.geom_bodyid[other_geom])
+                    body_rotation = data.xmat[other_body].reshape(3, 3)
+                    local_point = body_rotation.T @ (
+                        contact.pos - data.xpos[other_body]
+                    )
+                    world_normal = contact.frame[:3].copy()
+                    local_normal = body_rotation.T @ world_normal
+                    print(
+                        "  ball contact at abort:",
+                        mujoco.mj_id2name(
+                            model, mujoco.mjtObj.mjOBJ_GEOM, other_geom
+                        ),
+                        "distance=",
+                        round(float(contact.dist), 6),
+                        "normal_force=",
+                        round(float(contact_force[0]), 5),
+                        "point=",
+                        np.round(contact.pos, 4),
+                        "body-local point=",
+                        np.round(local_point, 5),
+                        "body-local normal=",
+                        np.round(local_normal, 4),
+                    )
                 return False
 
             if terminated or truncated:
                 print(f"  abort: episode ended during {stage}")
                 return False
 
-        error = np.max(np.abs(data.qpos[qpos_ids] - target_positions))
+        error = float(
+            np.max(np.abs(data.qpos[qpos_ids] - target_positions))
+        )
+        settle_frames = 0
+        while (
+            error > 0.03
+            and settle_frames < MAX_WAYPOINT_SETTLE_FRAMES
+        ):
+            _, _, terminated, truncated, _ = env.step(
+                action_for(target_positions)
+            )
+            settle_frames += 1
+
+            actual = data.qpos[qpos_ids].copy()
+            if not checker.pose_is_collision_free(actual):
+                print(f"  abort: jaw/table collision while settling {stage}")
+                return False
+
+            shift = np.linalg.norm(ball_position() - ball_start)
+            if shift > MAX_APPROACH_BALL_SHIFT:
+                print(
+                    f"  abort: ball shifted {shift * 1000:.1f} mm "
+                    f"while settling {stage}"
+                )
+                return False
+
+            if terminated or truncated:
+                print(f"  abort: episode ended while settling {stage}")
+                return False
+
+            error = float(
+                np.max(np.abs(actual - target_positions))
+            )
+
         if error > 0.03:
-            print(f"  abort: {stage} joint tracking error={error:.3f} rad")
+            print(
+                f"  abort: {stage} joint tracking error="
+                f"{error:.3f} rad after {settle_frames} settle frames"
+            )
             return False
         return True
 
-    def solve_lift_waypoint(target_xyz, seed_positions, fixed_wrist_gripper):
-        """Solve Cartesian XYZ using the first three arm joints."""
+    def solve_cartesian_waypoint(
+        target_xyz, seed_positions, fixed_wrist_gripper
+    ):
+        """Solve Cartesian XYZ while holding wrist and gripper joints fixed."""
         saved_qpos = data.qpos.copy()
         data.qpos[qpos_ids] = seed_positions
         data.qpos[qpos_ids[3:6]] = fixed_wrist_gripper
@@ -188,26 +270,117 @@ def main():
             )
             result["ball_z"] = float(ball_end[2])
 
+        def move_cartesian_path(
+            start_xyz,
+            target_xyz,
+            fixed_wrist_gripper,
+            waypoint_count,
+            stage,
+            start_wrist_gripper=None,
+        ):
+            for waypoint_index in range(1, waypoint_count + 1):
+                fraction = waypoint_index / waypoint_count
+                waypoint_xyz = start_xyz + fraction * (
+                    target_xyz - start_xyz
+                )
+                waypoint_wrist_gripper = fixed_wrist_gripper
+                if start_wrist_gripper is not None:
+                    waypoint_wrist_gripper = start_wrist_gripper + fraction * (
+                        fixed_wrist_gripper - start_wrist_gripper
+                    )
+                actual_start = data.qpos[qpos_ids].copy()
+                waypoint_q, ik_error = solve_cartesian_waypoint(
+                    waypoint_xyz, actual_start, waypoint_wrist_gripper
+                )
+                if ik_error > 0.003:
+                    print(
+                        f"  abort: {stage} IK error at waypoint "
+                        f"{waypoint_index} is {ik_error * 1000:.1f} mm"
+                    )
+                    return False
+                if not checker.candidate_is_safe(actual_start, waypoint_q):
+                    print(
+                        f"  abort: jaw/table path check failed during "
+                        f"{stage} at waypoint {waypoint_index}"
+                    )
+                    return False
+                max_joint_change = float(
+                    np.max(np.abs(waypoint_q - actual_start))
+                )
+                frame_count = max(
+                    MIN_FRAMES_PER_APPROACH_WAYPOINT,
+                    int(np.ceil(
+                        max_joint_change / RADIANS_PER_APPROACH_FRAME
+                    )),
+                )
+                if not move_to(
+                    waypoint_q,
+                    frame_count,
+                    f"{stage} waypoint {waypoint_index}",
+                    ball_start,
+                ):
+                    return False
+            return True
+
         start_q = data.qpos[qpos_ids].copy()
-        if not checker.candidate_is_safe(start_q, pregrasp_q):
-            result["reason"] = "pregrasp path failed collision check"
-            record_metrics()
-            return result
-        if not checker.candidate_is_safe(pregrasp_q, contact_open_q):
-            result["reason"] = "open approach failed collision check"
-            record_metrics()
-            return result
         if not checker.candidate_is_safe(contact_open_q, contact_closed_q):
             result["reason"] = "closing path failed collision check"
             record_metrics()
             return result
 
-        if not move_to(pregrasp_q, 400, "pregrasp", ball_start):
-            result["reason"] = "pregrasp motion failed"
+        fixed_open_wrist_gripper = pregrasp_q[3:6].copy()
+        reset_wrist_gripper = data.qpos[qpos_ids[3:6]].copy()
+        start_site = data.site_xpos[env.gripper_site].copy()
+        vertical_clearance = start_site + np.array(
+            [0.0, 0.0, APPROACH_CLEARANCE_METERS]
+        )
+        pregrasp_xyz = ball_start + offset + np.array([0.0, 0.0, 0.06])
+        contact_xyz = ball_start + offset
+        transit_xyz = pregrasp_xyz + np.array([0.0, 0.0, 0.06])
+        transit_xyz[2] = max(transit_xyz[2], vertical_clearance[2])
+
+        if not move_cartesian_path(
+            start_site,
+            vertical_clearance,
+            reset_wrist_gripper,
+            8,
+            "vertical clearance",
+        ):
+            result["reason"] = "vertical clearance motion failed"
             record_metrics()
             return result
-        if not move_to(contact_open_q, 400, "open-jaw approach", ball_start):
-            result["reason"] = "approach motion failed"
+        current_site = data.site_xpos[env.gripper_site].copy()
+        if not move_cartesian_path(
+            current_site,
+            transit_xyz,
+            fixed_open_wrist_gripper,
+            APPROACH_WAYPOINTS,
+            "high transit",
+            start_wrist_gripper=reset_wrist_gripper,
+        ):
+            result["reason"] = "high transit motion failed"
+            record_metrics()
+            return result
+        current_site = data.site_xpos[env.gripper_site].copy()
+        if not move_cartesian_path(
+            current_site,
+            pregrasp_xyz,
+            fixed_open_wrist_gripper,
+            APPROACH_WAYPOINTS,
+            "descent to pregrasp",
+        ):
+            result["reason"] = "pregrasp descent failed"
+            record_metrics()
+            return result
+        current_site = data.site_xpos[env.gripper_site].copy()
+        if not move_cartesian_path(
+            current_site,
+            contact_xyz,
+            fixed_open_wrist_gripper,
+            APPROACH_WAYPOINTS,
+            "open-jaw descent to contact",
+        ):
+            result["reason"] = "contact descent failed"
             record_metrics()
             return result
         if not move_to(contact_closed_q, 300, "gripper close", ball_start):
@@ -216,12 +389,8 @@ def main():
             return result
 
         ball_after_close = ball_position()
-        fixed_pad_geom = mujoco.mj_name2id(
-            model, mujoco.mjtObj.mjOBJ_GEOM, "fixed_finger_pad"
-        )
-        moving_pad_geom = mujoco.mj_name2id(
-            model, mujoco.mjtObj.mjOBJ_GEOM, "moving_finger_pad"
-        )
+        fixed_pad_geom = env.fixed_finger_pad_geom
+        moving_pad_geom = env.moving_finger_pad_geom
         pad_geoms = {fixed_pad_geom, moving_pad_geom}
         contacted_pads = set()
 
@@ -276,7 +445,7 @@ def main():
                 [0.0, 0.0, LIFT_METERS * waypoint_index / LIFT_WAYPOINTS]
             )
             actual_start = data.qpos[qpos_ids].copy()
-            waypoint_q, ik_error = solve_lift_waypoint(
+            waypoint_q, ik_error = solve_cartesian_waypoint(
                 target_xyz, actual_start, fixed_wrist_gripper
             )
 

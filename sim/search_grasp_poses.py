@@ -248,14 +248,46 @@ def main():
                 "Moving pad center when open:",
                 np.round(data.geom_xpos[env.moving_finger_pad_geom], 4),
             )
-            print(
-                "Moving-pad opening travel:",
-                np.round(
-                    data.geom_xpos[env.moving_finger_pad_geom]
-                    - closed_centers["moving"],
-                    4,
+            opening_travel = (
+                data.geom_xpos[env.moving_finger_pad_geom]
+                - closed_centers["moving"]
+            )
+            print("Moving-pad opening travel:", np.round(opening_travel, 4))
+
+            # The jaw closes opposite to its opening travel.
+            jaw_axis = -opening_travel / np.linalg.norm(opening_travel)
+
+            # At contact, each pad center should be one ball radius plus
+            # one pad radius from the ball center.
+            center_offset = (
+                model.geom_size[env.ball_geom, 0]
+                + model.geom_size[env.fixed_finger_pad_geom, 0]
+            )
+            data.qpos[qpos_ids] = best_contact_q
+            mujoco.mj_forward(model, data)
+            ball_center = data.xpos[env.ball_body].copy()
+
+            targets = (
+                ("fixed", "gripper", ball_center + center_offset * jaw_axis),
+                (
+                    "moving",
+                    "moving_jaw_so101_v1",
+                    ball_center - center_offset * jaw_axis,
                 ),
             )
+
+            for label, body_name, target_world in targets:
+                body_id = mujoco.mj_name2id(
+                    model, mujoco.mjtObj.mjOBJ_BODY, body_name
+                )
+                rotation = data.xmat[body_id].reshape(3, 3)
+                target_local = rotation.T @ (
+                    target_world - data.xpos[body_id]
+                )
+                print(
+                    f"XML pos for {label}_finger_pad:",
+                    np.round(target_local, 6),
+                )
         else:
             print("No candidate had simultaneous contact with both pads.")
 
