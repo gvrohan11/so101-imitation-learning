@@ -106,8 +106,7 @@
                 <geom type="mesh" class="collision" pos="0.0077 0.0001 -0.0234" quat="0.707107 -0.707107 1.66015e-15 6.45094e-15" mesh="sts3215_03a_v1" material="sts3215_03a_v1_material"/>
                 <!-- Part wrist_roll_follower_so101_v1 -->
                 <geom type="mesh" class="visual" pos="8.32667e-17 -0.000218214 0.000949706" quat="0 1 0 0" mesh="wrist_roll_follower_so101_v1" material="wrist_roll_follower_so101_v1_material"/>
-                    <!-- Rounded lower pads let their contact normals support the ball during the lift. -->
-                    <geom name="fixed_finger_collision" type="sphere" class="collision" pos="0.000953 -0.037697 -0.105051" size="0.004" friction="1.5 0.01 0.05" condim="6" contype="1" conaffinity="1"/>
+                    <geom name="fixed_finger_collision" type="mesh" class="collision" pos="8.32667e-17 -0.000218214 0.000949706" quat="0 1 0 0" mesh="fixed_finger_tip_collision" friction="1.5 0.01 0.05" condim="6" contype="1" conaffinity="1" solref="0.0005 1" solimp="0.999 0.9999 0.001 0.5 2"/>
                 <!-- Frame gripperframe -->
                 <site group="3" name="gripperframe" pos="-0.0079 -0.000218121 -0.0981274" quat="0.707107 -0 0.707107 -2.37788e-17"/>
                 <!-- Link moving_jaw_so101_v1 -->
@@ -117,7 +116,8 @@
                   <inertial pos="-0.00157495 -0.0300244 0.0192755" mass="0.012" fullinertia="6.61427e-06 1.89032e-06 5.28738e-06 -3.19807e-07 -5.90717e-09 -1.09945e-07"/>
                   <!-- Part moving_jaw_so101_v1 -->
                   <geom type="mesh" class="visual" pos="-5.55112e-17 -5.55112e-17 0.0189" quat="1 -0 3.00524e-16 -2.00834e-17" mesh="moving_jaw_so101_v1" material="moving_jaw_so101_v1_material"/>
-                  <geom name="moving_finger_collision" type="sphere" class="collision" pos="-0.018088 -0.052552 0.058006" size="0.004" friction="1.5 0.01 0.05" condim="6" contype="1" conaffinity="1"/>
+                  <!-- Contact geometry is the actual moving-finger CAD tip. -->
+                  <geom name="moving_finger_collision" type="mesh" class="collision" pos="-5.55112e-17 -5.55112e-17 0.0189" quat="1 0 3.00524e-16 -2.00834e-17" mesh="moving_finger_tip_collision" friction="1.5 0.01 0.05" condim="6" contype="1" conaffinity="1" solref="0.0005 1" solimp="0.999 0.9999 0.001 0.5 2"/>
                 </body>
               </body>
             </body>
@@ -127,6 +127,8 @@
     </body>
   </worldbody>
   <asset>
+    <mesh name="fixed_finger_tip_collision" file="fixed_finger_tip_collision.stl"/>
+    <mesh name="moving_finger_tip_collision" file="moving_finger_tip_collision.stl"/>
     <mesh file="waveshare_mounting_plate_so101_v2.stl"/>
     <mesh file="sts3215_03a_v1.stl"/>
     <mesh file="motor_holder_so101_base_v1.stl"/>

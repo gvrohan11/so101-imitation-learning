@@ -12,9 +12,7 @@ JOINT_NAMES = (
     "gripper"
 )
 
-MIN_HORIZONTAL_PINCH_OPPOSITION = -0.40
-MAX_PINCH_CONTACT_VERTICAL_COMPONENT = 0.65
-MIN_UPWARD_PINCH_COMPONENT = 0.10
+MIN_HORIZONTAL_PINCH_OPPOSITION = -0.75
 MAX_PINCH_PENETRATION = 0.004
 
 class BallCupEnv:
@@ -69,8 +67,34 @@ class BallCupEnv:
         self.fixed_finger_geom = get_id(
             mujoco.mjtObj.mjOBJ_GEOM, "fixed_finger_collision"
         )
+        self.fixed_finger_geoms = frozenset(
+            geom_id
+            for geom_id in range(self.model.ngeom)
+            if (name := mujoco.mj_id2name(
+                self.model, mujoco.mjtObj.mjOBJ_GEOM, geom_id
+            )) is not None
+            and (
+                name == "fixed_finger_collision"
+                or name.startswith("fixed_finger_collision_section_")
+            )
+        )
         self.moving_finger_geom = get_id(
             mujoco.mjtObj.mjOBJ_GEOM, "moving_finger_collision"
+        )
+        self.moving_finger_geoms = frozenset(
+            geom_id
+            for geom_id in range(self.model.ngeom)
+            if (name := mujoco.mj_id2name(
+                self.model, mujoco.mjtObj.mjOBJ_GEOM, geom_id
+            )) is not None
+            and (
+                name == "moving_finger_collision"
+                or name.startswith("moving_finger_collision_")
+            )
+        )
+        self.finger_geom_groups = (
+            self.fixed_finger_geoms,
+            self.moving_finger_geoms,
         )
         self.cup_body = get_id(mujoco.mjtObj.mjOBJ_BODY, "cup")
 
@@ -328,12 +352,11 @@ class BallCupEnv:
 
 
     def _is_pinched(self):
-        required_fingers = sorted(
-            (
-                self.fixed_finger_geom,
-                self.moving_finger_geom,
-            )
-        )
+        finger_group = {
+            geom: group_index
+            for group_index, geoms in enumerate(self.finger_geom_groups)
+            for geom in geoms
+        }
         best_contact = {}
 
         for i in range(self.data.ncon):
@@ -346,47 +369,52 @@ class BallCupEnv:
             else:
                 continue
 
-            if finger_geom not in required_fingers:
+            group_index = finger_group.get(finger_geom)
+            if group_index is None:
                 continue
 
-            previous = best_contact.get(finger_geom)
+            # MuJoCo can keep a contact record for separated shapes inside
+            # the collision margin. A pinch requires the real finger surface
+            # to touch or penetrate the ball, not just be nearby.
+            if contact.dist > 0.0:
+                continue
+
+            previous = best_contact.get(group_index)
             if previous is None or contact.dist < previous[0]:
-                best_contact[finger_geom] = (
+                best_contact[group_index] = (
                     float(contact.dist),
                     contact.pos.copy(),
                 )
 
-        if not all(finger in best_contact for finger in required_fingers):
+        required_groups = range(len(self.finger_geom_groups))
+        if not all(group in best_contact for group in required_groups):
             return False
 
         if any(
-            best_contact[finger][0] < -MAX_PINCH_PENETRATION
-            for finger in required_fingers
+            best_contact[group][0] < -MAX_PINCH_PENETRATION
+            for group in required_groups
         ):
             return False
 
         ball_center = self.data.xpos[self.ball_body]
         directions = []
 
-        for finger in required_fingers:
-            direction = best_contact[finger][1] - ball_center
+        for group in required_groups:
+            direction = best_contact[group][1] - ball_center
             length = np.linalg.norm(direction)
             if length < 1e-8:
                 return False
             directions.append(direction / length)
 
-        # The jaw normals must oppose horizontally and point up the ball's
-        # lower hemisphere so they can support it during the lift.
+        # The two actual finger surfaces must contact opposite sides of the
+        # ball. Do not require a below-center contact: the physical SO101
+        # fingertips contact near the ball's equator, where friction carries
+        # its weight during a lift.
         horizontal = []
         for direction in directions:
             horizontal_direction = direction[:2]
             horizontal_length = np.linalg.norm(horizontal_direction)
-            if (
-                direction[2] >= -MIN_UPWARD_PINCH_COMPONENT
-                or abs(float(direction[2]))
-                > MAX_PINCH_CONTACT_VERTICAL_COMPONENT
-                or horizontal_length < 1e-8
-            ):
+            if horizontal_length < 1e-8:
                 return False
             horizontal.append(horizontal_direction / horizontal_length)
 

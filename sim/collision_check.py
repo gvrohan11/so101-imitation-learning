@@ -17,7 +17,7 @@ class JawTableCollisionChecker:
             [env.joint_qpos[name] for name in JOINT_NAMES], dtype=np.int32
         )
         self.moving_jaw_body = env.moving_jaw_body
-        self.moving_finger_geom = env.moving_finger_geom
+        self.moving_finger_geoms = env.moving_finger_geoms
         self.last_collision = None
         self.last_collision_qpos = None
         self.table_geom = mujoco.mj_name2id(
@@ -59,7 +59,7 @@ class JawTableCollisionChecker:
                 # closes around a ball resting on the surface. Reject a real
                 # penetration, but do not reject an otherwise valid grasp for
                 # a tiny solver overlap at the pad's rounded end.
-                if other_geom == self.moving_finger_geom:
+                if other_geom in self.moving_finger_geoms:
                     if contact.dist < -0.001:
                         self.last_collision = (
                             mujoco.mj_id2name(

@@ -43,11 +43,37 @@ def main():
         gripper_approach = 0.70
         gripper_contact_open = 0.70
 
-        # Use the wrist pose and side-approach offset validated by the
-        # dynamic lower-pad lift diagnostic.
-        wrist_flex_values = np.array([-1.25])
-        wrist_roll_values = np.array([-1.65])
-        offsets = [np.array([0.028, 0.0009, 0.032])]
+        # The sphere proxies used an offset well below the gripper frame.
+        # Search the wrist orientation and frame offset that put the real
+        # fingertips on opposite lower sides of the ball.
+        # Include the slightly tucked-wrist family: the SO101 moving jaw
+        # otherwise closes with a large vertical sweep and drives the ball
+        # along the fingertip taper before it can support a lift.
+        wrist_flex_values = np.array([-0.3, -0.2, -0.1, 0.1, 0.3, 0.5])
+        # Scan the whole reachable wrist-roll range. The earlier narrow bands
+        # put the moving fingertip's thin CAD axis across the ball's lateral
+        # slip direction, so a static opposed pinch could not carry it.
+        wrist_roll_values = np.array(
+            sorted(
+                {
+                    round(float(value), 6)
+                    for value in np.concatenate(
+                        (
+                            np.arange(-2.7, 2.81, 0.3),
+                            np.arange(-2.7, -2.29, 0.05),
+                        )
+                    )
+                }
+            )
+        )
+        offsets = [
+            np.array(offset, dtype=np.float64)
+            for offset in product(
+                (-0.020, -0.012, 0.012, 0.020),
+                (-0.020, -0.012, -0.008, 0.012, 0.020),
+                (-0.010, -0.006, -0.002),
+            )
+        ]
 
         def solve_site(target, wrist_flex, wrist_roll, gripper_angle):
             saved_qpos = data.qpos.copy()
@@ -109,30 +135,32 @@ def main():
                 else:
                     continue
 
-                if finger_geom not in (
-                    env.fixed_finger_geom,
-                    env.moving_finger_geom,
-                ):
+                group_index = next(
+                    (
+                        index
+                        for index, geoms in enumerate(env.finger_geom_groups)
+                        if finger_geom in geoms
+                    ),
+                    None,
+                )
+                if group_index is None:
                     continue
 
-                old = finger_contacts.get(finger_geom)
+                old = finger_contacts.get(group_index)
                 if old is None or contact.dist < old[0]:
-                    finger_contacts[finger_geom] = (
+                    finger_contacts[group_index] = (
                         float(contact.dist),
                         contact.pos.copy(),
                     )
 
             opposition = None
             contact_heights = None
-            required = (
-                env.fixed_finger_geom,
-                env.moving_finger_geom,
-            )
+            required = range(len(env.finger_geom_groups))
             if all(finger in finger_contacts for finger in required):
                 center = data.xpos[env.ball_body]
                 directions = []
-                for finger in required:
-                    direction = finger_contacts[finger][1] - center
+                for group_index in required:
+                    direction = finger_contacts[group_index][1] - center
                     length = np.linalg.norm(direction)
                     if length > 1e-8:
                         direction = direction / length
@@ -142,8 +170,10 @@ def main():
                         np.dot(directions[0], directions[1])
                     )
                     contact_heights = tuple(
-                        float(finger_contacts[finger][1][2] - center[2])
-                        for finger in required
+                        float(
+                            finger_contacts[group_index][1][2] - center[2]
+                        )
+                        for group_index in required
                     )
 
             is_pinched = bool(env._is_pinched())
@@ -192,7 +222,7 @@ def main():
             data.qpos[qpos_ids] = joint_positions
             mujoco.mj_forward(model, data)
             distances = []
-            required = {env.fixed_finger_geom, env.moving_finger_geom}
+            required = set().union(*env.finger_geom_groups)
             for i in range(data.ncon):
                 contact = data.contact[i]
                 if env.ball_geom not in (contact.geom1, contact.geom2):
@@ -226,7 +256,7 @@ def main():
             wrist_flex_values, wrist_roll_values, offsets
         ):
             contact_target = ball + offset
-            pregrasp_target = contact_target + np.array([0.0, 0.05, 0.06])
+            pregrasp_target = contact_target + np.array([0.0, 0.0, 0.09])
 
             pregrasp_q, pregrasp_error = solve_site(
                 pregrasp_target, wrist_flex, wrist_roll, gripper_approach
@@ -271,6 +301,13 @@ def main():
                 no_safe_pinch += 1
                 continue
             contact_pinch_q, opposition, contact_heights = first_pinch
+            contact_height_span = abs(
+                contact_heights[0] - contact_heights[1]
+            )
+            contact_height_mean = abs(float(np.mean(contact_heights)))
+            if contact_height_span > 0.006 or contact_height_mean > 0.008:
+                no_safe_pinch += 1
+                continue
             if not checker.candidate_is_safe(
                 contact_open_q, contact_pinch_q
             ):
@@ -333,14 +370,15 @@ def main():
             ball_center = data.xpos[env.ball_body].copy()
             print("Ball center:", np.round(ball_center, 4))
 
-            for label, finger_geom in (
-                ("fixed", env.fixed_finger_geom),
-                ("moving", env.moving_finger_geom),
+            for label, finger_geoms in (
+                ("fixed", env.fixed_finger_geoms),
+                ("moving", env.moving_finger_geoms),
             ):
                 for i in range(data.ncon):
                     contact = data.contact[i]
                     pair = {int(contact.geom1), int(contact.geom2)}
-                    if env.ball_geom in pair and finger_geom in pair:
+                    if env.ball_geom in pair and pair.intersection(finger_geoms):
+                        finger_geom = min(pair.intersection(finger_geoms))
                         point = contact.pos.copy()
                         print(
                             f"{label} finger mesh: geom origin="
@@ -352,7 +390,9 @@ def main():
 
             closed_centers = {
                 "fixed": data.geom_xpos[env.fixed_finger_geom].copy(),
-                "moving": data.geom_xpos[env.moving_finger_geom].copy(),
+                "moving": np.mean(
+                    data.geom_xpos[list(env.moving_finger_geoms)], axis=0
+                ),
             }
 
             data.qpos[qpos_ids[-1]] = gripper_open
@@ -364,10 +404,17 @@ def main():
             )
             print(
                 "Moving finger mesh origin when open:",
-                np.round(data.geom_xpos[env.moving_finger_geom], 4),
+                np.round(
+                    np.mean(
+                        data.geom_xpos[list(env.moving_finger_geoms)], axis=0
+                    ),
+                    4,
+                ),
             )
             opening_travel = (
-                data.geom_xpos[env.moving_finger_geom]
+                np.mean(
+                    data.geom_xpos[list(env.moving_finger_geoms)], axis=0
+                )
                 - closed_centers["moving"]
             )
             print("Moving-finger opening travel:", np.round(opening_travel, 4))
@@ -382,8 +429,29 @@ def main():
             return []
 
         safe_paths.sort(key=lambda item: item[0])
+        roll_joint_low, roll_joint_high = model.jnt_range[joint_ids[4]]
         safe_pinch_candidates.sort(
-            key=lambda item: (max(item[8]), item[7], item[0])
+            key=lambda item: (
+                # This actual-fingertip pose passed the dynamic carry test;
+                # try it first instead of preferring a static score that
+                # ignores whether the ball survives transport.
+                abs(item[1] - 0.5)
+                + abs(item[2] + 2.7)
+                + 100.0 * float(
+                    np.linalg.norm(
+                        item[3] - np.array([0.020, -0.008, -0.010])
+                    )
+                ),
+                abs(item[8][0] - item[8][1]),
+                abs(float(np.mean(item[8])) + 0.005),
+                item[7],
+                -min(
+                    item[4][4] - roll_joint_low,
+                    roll_joint_high - item[4][4],
+                ),
+                max(item[8]),
+                item[0],
+            )
         )
         print("\nFirst jaw-table-clear static two-jaw candidates:")
         shown = 0
