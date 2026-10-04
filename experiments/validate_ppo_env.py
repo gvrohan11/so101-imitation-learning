@@ -14,12 +14,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from sim.rl_env import BallCupTrainingEnv
+from sim.rl_env import BallCupTrainingEnv, CLOCK_OBSERVATION_START
 from sim.training_config import load_training_config
 
 
 def assert_finite_observation(observation):
-    assert observation.shape == (25,), observation.shape
+    assert observation.ndim == 1 and observation.shape[0] >= 23, observation.shape
     assert np.all(np.isfinite(observation))
 
 
@@ -27,19 +27,52 @@ def validate_action_mapping(env):
     observation, _ = env.reset(seed=19)
     assert_finite_observation(observation)
     current = env.data.qpos[env.joint_qpos[:5]].copy()
+    current_gripper = float(env.data.qpos[env.joint_qpos[5]])
     targets, gripper, _ = env.map_action_to_targets(np.ones(6, dtype=np.float32))
     expected = np.minimum(
-        current + np.deg2rad(2.0), env.joint_ranges[:, 1]
+        current + env.max_arm_delta, env.joint_ranges[:, 1]
     )
     np.testing.assert_allclose(targets, expected, atol=1e-7)
-    assert gripper == env.open_gripper_target
+    assert gripper == min(
+        env.open_gripper_target,
+        current_gripper + env.gripper_action_delta,
+    )
 
-    _, closed, _ = env.map_action_to_targets(np.array([0, 0, 0, 0, 0, -1]))
-    _, held, _ = env.map_action_to_targets(np.zeros(6))
-    _, opened, _ = env.map_action_to_targets(np.array([0, 0, 0, 0, 0, 1]))
-    assert closed == env.close_gripper_target
-    assert held == closed
-    assert opened == env.open_gripper_target
+    # Reset starts fully open, where a positive command must saturate rather
+    # than move farther. Check the exact bounded increment from that state,
+    # then repeat from an interior position to exercise both directions.
+    gripper_actions = np.zeros(6)
+    gripper_actions[5] = -1.0
+    _, closed, _ = env.map_action_to_targets(gripper_actions)
+    gripper_actions[5] = 0.0
+    _, held, _ = env.map_action_to_targets(gripper_actions)
+    gripper_actions[5] = 1.0
+    _, opened, _ = env.map_action_to_targets(gripper_actions)
+    assert closed == max(
+        env.gripper_policy_close_target,
+        current_gripper - env.gripper_action_delta,
+    )
+    assert held == current_gripper
+    assert opened == min(
+        env.open_gripper_target,
+        current_gripper + env.gripper_action_delta,
+    )
+
+    interior_gripper = 0.5 * (
+        env.gripper_policy_close_target + env.open_gripper_target
+    )
+    env.data.qpos[env.joint_qpos[5]] = interior_gripper
+    mujoco.mj_forward(env.model, env.data)
+    gripper_actions[5] = -1.0
+    _, closed, _ = env.map_action_to_targets(gripper_actions)
+    gripper_actions[5] = 0.0
+    _, held, _ = env.map_action_to_targets(gripper_actions)
+    gripper_actions[5] = 1.0
+    _, opened, _ = env.map_action_to_targets(gripper_actions)
+    assert closed == interior_gripper - env.gripper_action_delta
+    assert held == interior_gripper
+    assert opened == interior_gripper + env.gripper_action_delta
+    assert opened - interior_gripper <= env.gripper_action_delta + 1e-8
 
     high = env.joint_ranges[0, 1]
     env.data.qpos[env.joint_qpos[0]] = high - 1e-4
@@ -237,7 +270,9 @@ def main():
     random_result = validate_random_rollouts()
     print(json.dumps({
         "gymnasium_env_checker": "passed",
-        "observation_shape": [25],
+        "observation_shape": [
+            CLOCK_OBSERVATION_START + int(config["task"]["episode_steps"])
+        ],
         "action_shape": [6],
         "action_mapping_and_joint_limits": "passed",
         "gripper_open_close_motion": "passed",

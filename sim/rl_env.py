@@ -16,6 +16,7 @@ from sim.training_config import load_training_config
 ARM_JOINT_NAMES = JOINT_NAMES[:5]
 CONTROL_HZ = 20
 PHYSICS_HZ = 500
+CLOCK_OBSERVATION_START = 25
 
 
 class BallCupTrainingEnv(gym.Env):
@@ -116,6 +117,18 @@ class BallCupTrainingEnv(gym.Env):
         self.close_gripper_target = float(
             self.model.actuator_ctrlrange[self.sim.actuator_ids[-1], 0]
         )
+        self.gripper_policy_close_target = float(
+            self.task["gripper_policy_close_target_rad"]
+        )
+        self.gripper_action_delta = float(self.task["gripper_action_delta_rad"])
+        if not (
+            self.close_gripper_target
+            <= self.gripper_policy_close_target
+            < self.open_gripper_target
+        ):
+            raise ValueError("gripper_policy_close_target_rad is outside the actuator range")
+        if self.gripper_action_delta <= 0.0:
+            raise ValueError("gripper_action_delta_rad must be positive")
         self.max_arm_delta = float(
             np.deg2rad(self.task["arm_delta_degrees"])
         )
@@ -178,13 +191,15 @@ class BallCupTrainingEnv(gym.Env):
         self.action_space = spaces.Box(
             low=-1.0, high=1.0, shape=(6,), dtype=np.float32
         )
-        # 6 joint positions + 6 joint velocities + EE/ball/cup positions (9)
-        # + gripper command state (1) + ball linear velocity (3) = 25.
+        # 6 measured joint positions + 6 velocities + EE/ball/cup positions (9)
+        # + ball linear velocity (3) + time fraction (1) + a finite-horizon
+        # one-hot clock. Actual gripper state supports feedback for relative
+        # gripper actions; the clock makes demo phases identifiable.
         float32_limit = np.finfo(np.float32).max
         self.observation_space = spaces.Box(
             low=-float32_limit,
             high=float32_limit,
-            shape=(25,),
+            shape=(CLOCK_OBSERVATION_START + self.horizon,),
             dtype=np.float32,
         )
         self.steps = 0
@@ -406,9 +421,7 @@ class BallCupTrainingEnv(gym.Env):
             raise RuntimeError("Reset produced a colliding robot start")
 
         self._reset_episode_state()
-        self._previous_reach_distance = float(
-            np.linalg.norm(self.data.site_xpos[self.sim.gripper_site] - self.data.xpos[self.sim.ball_body])
-        )
+        self._previous_approach_distance = self._approach_path_distance()[0]
         self._best_transport_distance = float(
             np.linalg.norm(self.data.xpos[self.sim.ball_body, :2] - self.data.xpos[self.sim.cup_body, :2])
         )
@@ -424,7 +437,7 @@ class BallCupTrainingEnv(gym.Env):
         return obs, info
 
     def map_action_to_targets(self, action: np.ndarray):
-        """Map normalized actions to clipped relative arm targets and gripper."""
+        """Map arm actions to bounded joint steps and gripper action to position."""
         action = np.asarray(action, dtype=np.float64)
         if action.shape != (6,):
             raise ValueError(f"Expected six actions, got shape {action.shape}")
@@ -440,11 +453,51 @@ class BallCupTrainingEnv(gym.Env):
             np.sum(np.abs(requested - targets) / max(self.max_arm_delta, 1e-8))
         )
         gripper_action = float(action[5])
-        if gripper_action < float(self.task["gripper_close_threshold"]):
-            self._gripper_target = self.close_gripper_target
-        elif gripper_action > float(self.task["gripper_open_threshold"]):
-            self._gripper_target = self.open_gripper_target
+        current_gripper = float(self.data.qpos[self.joint_qpos[5]])
+        self._gripper_target = float(
+            np.clip(
+                current_gripper + gripper_action * self.gripper_action_delta,
+                self.gripper_policy_close_target,
+                self.open_gripper_target,
+            )
+        )
         return targets, self._gripper_target, clipped_fraction
+
+    def _approach_path_distance(self):
+        """Distance left along the demonstrated pregrasp-to-pinch approach."""
+        ee = self.data.site_xpos[self.sim.gripper_site]
+        ball = self.data.xpos[self.sim.ball_body]
+        offset = np.asarray(self.task["grasp_site_offset_m"], dtype=np.float64)
+        contact = ball + offset
+        clearance = float(self.task["grasp_approach_clearance_m"])
+        pregrasp = contact + np.asarray([0.0, 0.0, clearance])
+        approach_vector = contact - pregrasp
+        projection = float(
+            np.dot(ee - pregrasp, approach_vector)
+            / max(float(np.dot(approach_vector, approach_vector)), 1e-12)
+        )
+        if projection < 0.0:
+            path_distance = float(np.linalg.norm(ee - pregrasp) + clearance)
+        else:
+            path_distance = float(np.linalg.norm(ee - contact))
+
+        wrist_error = np.asarray(
+            [
+                self.data.qpos[self.joint_qpos[3]]
+                - float(self.task["grasp_wrist_flex_rad"]),
+                self.data.qpos[self.joint_qpos[4]]
+                - float(self.task["grasp_wrist_roll_rad"]),
+            ],
+            dtype=np.float64,
+        )
+        orientation_distance = float(
+            self.task["grasp_orientation_distance_scale_m_per_rad"]
+            * np.linalg.norm(wrist_error)
+        )
+        position_error = float(np.linalg.norm(ee - contact))
+        return path_distance + orientation_distance, position_error, float(
+            np.linalg.norm(wrist_error)
+        )
 
     def _cup_dimensions(self):
         # Geometry comes from the compiled octagonal cup: 50 mm wall-center
@@ -504,9 +557,18 @@ class BallCupTrainingEnv(gym.Env):
         cup = self.data.xpos[self.sim.cup_body]
         ball_velocity = self.data.qvel[self.sim.ball_qvel:self.sim.ball_qvel + 3]
         observation = np.concatenate(
-            [positions, velocities, ee, ball, cup, [self._gripper_target], ball_velocity]
+            [
+                positions,
+                velocities,
+                ee,
+                ball,
+                cup,
+                ball_velocity,
+                [self.steps / self.horizon],
+                np.eye(1, self.horizon, min(self.steps, self.horizon - 1))[0],
+            ]
         ).astype(np.float32)
-        if observation.shape != (25,):
+        if observation.shape != (CLOCK_OBSERVATION_START + self.horizon,):
             raise RuntimeError(f"Internal observation has shape {observation.shape}")
         return observation
 
@@ -536,6 +598,9 @@ class BallCupTrainingEnv(gym.Env):
         return False
 
     def _episode_info(self, *, is_success: bool) -> dict:
+        approach_distance, grasp_position_error, grasp_wrist_error = (
+            self._approach_path_distance()
+        )
         return {
             "is_success": bool(is_success),
             "curriculum_stage": int(self.stage),
@@ -549,6 +614,9 @@ class BallCupTrainingEnv(gym.Env):
             "currently_pinched": bool(self.currently_pinched),
             "holding_ball": bool(self.holding_ball),
             "failure_reason": self.failure_reason,
+            "approach_path_distance_m": float(approach_distance),
+            "grasp_position_error_m": float(grasp_position_error),
+            "grasp_wrist_error_rad": float(grasp_wrist_error),
         }
 
     def step(self, action):
@@ -595,9 +663,12 @@ class BallCupTrainingEnv(gym.Env):
             ee = self.data.site_xpos[self.sim.gripper_site]
             ball = self.data.xpos[self.sim.ball_body]
             cup = self.data.xpos[self.sim.cup_body]
-            current_reach_distance = float(np.linalg.norm(ee - ball))
+            _, grasp_position_error, grasp_wrist_error = self._approach_path_distance()
             self.reach_success = self.reach_success or (
-                current_reach_distance <= float(self.task["reach_threshold_m"])
+                grasp_position_error
+                <= float(self.task["grasp_pose_reach_threshold_m"])
+                and grasp_wrist_error
+                <= float(self.task["grasp_wrist_reach_tolerance_rad"])
             )
             if self.grasp_success:
                 self.lift_success = self.lift_success or (
@@ -649,17 +720,15 @@ class BallCupTrainingEnv(gym.Env):
 
         reward_terms = {name: 0.0 for name in self.reward_totals}
         if not invalid_state:
-            reach_distance = float(
-                np.linalg.norm(self.data.site_xpos[self.sim.gripper_site] - self.data.xpos[self.sim.ball_body])
-            )
+            approach_distance = self._approach_path_distance()[0]
             if not previously_grasped and not self.grasp_success:
-                # Signed potential difference telescopes; approaching and
-                # retreating cannot create unbounded reward by hovering.
+                # Potential follows the demonstrated above-ball waypoint and
+                # final fingertip contact pose, including wrist orientation.
                 reward_terms["reach_progress"] = float(
                     self.reward_config["reach_progress_per_meter"]
-                    * (self._previous_reach_distance - reach_distance)
+                    * (self._previous_approach_distance - approach_distance)
                 )
-            self._previous_reach_distance = reach_distance
+            self._previous_approach_distance = approach_distance
 
             if self.grasp_success and not previously_grasped:
                 reward_terms["grasp"] = float(self.reward_config["grasp_once"])

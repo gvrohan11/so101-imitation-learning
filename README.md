@@ -35,14 +35,20 @@ finger collision meshes. Run the environment checks before training:
   with 25 physics steps per action and a 500-action / 25-second horizon.
 - Actions are six normalized values in `[-1, 1]`. The first five move the
   shoulder pan, shoulder lift, elbow, wrist flex, and wrist roll targets by at
-  most 2 degrees relative to the current joint positions. Targets clip to the
-  model's actual joint limits. The sixth closes below `-0.5`, opens above
-  `+0.5`, and holds its previous target in between. Existing position servos
-  and their force limits remain in use.
-- The 25-value state contains all six joint positions, all six joint
-  velocities, gripper XYZ, ball XYZ, cup XYZ, the gripper's commanded state,
-  and the ball's linear velocity. PPO receives normalized state, not camera
+  most 2 degrees relative to current measured joint positions. Targets clip to
+  the model's joint limits. The sixth changes the gripper target by at most
+  0.1 rad per 20 Hz action, relative to its measured joint position, and clips
+  to the safe pinch target (`0.26` rad) and open target. Existing position
+  servos and force limits remain in use.
+- The observation has 25 physical values—six measured joint positions, six
+  measured velocities, gripper XYZ, ball XYZ, cup XYZ, ball linear velocity,
+  and time fraction—followed by a 500-value one-hot policy clock. The default
+  observation shape is 525. PPO receives normalized state and clock, not camera
   pixels.
+- Approach shaping follows the demonstrated path: a waypoint 60 mm above the
+  grasp site, then the grasp site's offset `(0.020, -0.008, -0.010)` m from
+  the ball center with wrist flex `0.5` rad and wrist roll `-2.7` rad. A reach
+  event requires the site within 15 mm and both wrist targets within 0.2 rad.
 - The arm starts at `[0, 0, 0, 0, 0]` radians with an open gripper. The model
   joint ranges (radians) are shoulder pan `[-1.9199, 1.9199]`, shoulder lift
   `[-1.7453, 1.7453]`, elbow `[-1.69, 1.69]`, wrist flex
@@ -70,15 +76,27 @@ and unrecoverable failure `10`. Progress is signed or best-so-far; event bonuses
 are one-time, so hovering, oscillating, or repeating grasps cannot farm reward.
 All weights and thresholds are in `config/ppo_training.json`.
 
-PPO uses Stable-Baselines3 with a `[128, 128]` tanh MLP, learning rate
-`3e-4`, rollout length `2048`, minibatch `256`, 10 epochs, gamma `0.99`, GAE
-lambda `0.95`, clip `0.2`, entropy coefficient `0.01`, value coefficient
-`0.5`, and gradient norm `0.5`. Observation normalization is enabled; reward
-normalization is off so logged returns retain the configured reward scale.
+PPO uses Stable-Baselines3 with a 512-unit tanh actor layer and a `[512, 512]`
+value network, learning rate `3e-4`, rollout length `2048`, minibatch `256`,
+10 epochs, gamma `0.99`, GAE lambda `0.95`, clip `0.2`, entropy coefficient
+`0.001`, value coefficient `0.5`, and gradient norm `0.5`. Observation
+normalization is enabled; reward normalization is off so logged returns retain
+the configured reward scale.
+
+Before PPO starts, the code generates a successful retimed expert episode at
+20 Hz, checks every arm action against the 2-degree bound, and initializes the
+actor's clock units from that action sequence. The deterministic Stage 1
+warm-start must reach at least 80% success over 10 episodes or training stops.
+Run this validation first; it saves the demonstration, policy, normalization
+statistics, and warm-start report without launching PPO:
+
+```bash
+.venv/bin/python -m experiments.train_ppo --initialize-only
+```
 
 The short smoke test runs 128 PPO steps and two deterministic evaluation
-episodes. It does not launch the curriculum. To start the full five-stage
-curriculum when ready:
+episodes. It does not launch the curriculum. After the initialization-only run
+passes, start the full five-stage curriculum with:
 
 ```bash
 .venv/bin/python -m experiments.train_ppo

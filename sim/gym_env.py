@@ -40,5 +40,5 @@ class LegacyAbsoluteTargetBallCupEnv(gym.Env):
 
 
 # Keep the established import name, but route new policy code through the
-# physically bounded relative-joint task and its 25-value observation.
+# physically bounded relative-joint task and its finite-horizon observation.
 StateOnlyBallCupEnv = BallCupTrainingEnv
