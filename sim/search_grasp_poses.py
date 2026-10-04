@@ -11,7 +11,8 @@ from sim.ball_cup_env import (
 from sim.collision_check import JawTableCollisionChecker
 
 def main():
-    env = BallCupEnv(render_images=False)
+    ball_radius = float(os.environ.get("SO101_DIAGNOSTIC_BALL_RADIUS", "0.020"))
+    env = BallCupEnv(render_images=False, ball_radius=ball_radius)
     model, data = env.model, env.data
 
     try:

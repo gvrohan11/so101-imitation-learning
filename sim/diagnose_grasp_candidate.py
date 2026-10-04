@@ -24,7 +24,7 @@ LIFT_WAYPOINTS = 25
 FRAMES_PER_LIFT_WAYPOINT = 30
 MIN_FRAMES_PER_PLACE_WAYPOINT = 100
 CUP_SETTLE_FRAMES = 1800
-CUP_STABLE_FRAMES = 100
+CUP_STABLE_FRAMES = 150
 
 # Abort an approach if it pushes the ball too far.
 MAX_APPROACH_BALL_SHIFT = 0.012  # meters
@@ -61,7 +61,13 @@ def main():
 
     # The full placement path can exceed 10,000 control steps. Keep a real
     # diagnostic run alive through transfer and release.
-    env = BallCupEnv(render_images=False, frame_skip=1, horizon=100000)
+    ball_radius = float(os.environ.get("SO101_DIAGNOSTIC_BALL_RADIUS", "0.020"))
+    env = BallCupEnv(
+        render_images=False,
+        frame_skip=1,
+        horizon=100000,
+        ball_radius=ball_radius,
+    )
     model, data = env.model, env.data
     qpos_ids = np.array(
         [env.joint_qpos[name] for name in JOINT_NAMES], dtype=np.int32
@@ -1337,7 +1343,7 @@ def main():
         result["pick_success"] = pick_success
 
         if pick_success:
-            cup_position = model.body_pos[env.cup_body].copy()
+            cup_position = data.xpos[env.cup_body].copy()
             cup_wall_geom = mujoco.mj_name2id(
                 model, mujoco.mjtObj.mjOBJ_GEOM, "cup_wall_0"
             )

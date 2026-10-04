@@ -23,6 +23,7 @@ class BallCupEnv:
         horizon=300,
         seed=None,
         render_images=True,
+        ball_radius=0.020,
     ):
         root = Path(__file__).resolve().parents[1]
         scene = root / "assets" / "SO101" / "ball_cup_scene.xml"
@@ -64,6 +65,21 @@ class BallCupEnv:
         self.ball_qvel = self.model.jnt_dofadr[self.ball_joint]
         self.ball_body = get_id(mujoco.mjtObj.mjOBJ_BODY, "ball")
         self.ball_geom = get_id(mujoco.mjtObj.mjOBJ_GEOM, "ball_geom")
+        self.ball_variants = {
+            0.020: self._ball_variant_ids("ball", "ball_geom", "ball_free"),
+            0.0195: self._ball_variant_ids(
+                "ball_s0195", "ball_geom_s0195", "ball_s0195_free", "ball_s0195_parked"
+            ),
+            0.0205: self._ball_variant_ids(
+                "ball_s0205", "ball_geom_s0205", "ball_s0205_free", "ball_s0205_parked"
+            ),
+        }
+        self._ball_variant_rgba = {
+            variant["geom"]: self.model.geom_rgba[variant["geom"]].copy()
+            for variant in self.ball_variants.values()
+        }
+        self.ball_radius = float(ball_radius)
+        self._select_ball_variant(self.ball_radius)
         self.fixed_finger_geom = get_id(
             mujoco.mjtObj.mjOBJ_GEOM, "fixed_finger_collision"
         )
@@ -97,6 +113,7 @@ class BallCupEnv:
             self.moving_finger_geoms,
         )
         self.cup_body = get_id(mujoco.mjtObj.mjOBJ_BODY, "cup")
+        self.cup_mocap_id = int(self.model.body_mocapid[self.cup_body])
 
         self.fixed_gripper_body = get_id(
             mujoco.mjtObj.mjOBJ_BODY, "gripper"
@@ -121,12 +138,52 @@ class BallCupEnv:
 
     def _ball_in_cup(self):
         ball = self.data.xpos[self.ball_body]
-        cup = self.model.body_pos[self.cup_body]
+        cup = self.data.xpos[self.cup_body]
         radius_from_center = np.linalg.norm(ball[:2] - cup[:2])
         return (
             radius_from_center < 0.025
             and 0.025 <= ball[2] <= 0.075
         )
+
+    def _ball_variant_ids(self, body_name, geom_name, joint_name, equality_name=None):
+        def get_id(kind, name):
+            value = mujoco.mj_name2id(self.model, kind, name)
+            if value < 0:
+                raise ValueError(f"MuJoCo model is missing {name!r}")
+            return int(value)
+
+        body_id = get_id(mujoco.mjtObj.mjOBJ_BODY, body_name)
+        geom_id = get_id(mujoco.mjtObj.mjOBJ_GEOM, geom_name)
+        joint_id = get_id(mujoco.mjtObj.mjOBJ_JOINT, joint_name)
+        equality_id = -1
+        if equality_name is not None:
+            equality_id = get_id(mujoco.mjtObj.mjOBJ_EQUALITY, equality_name)
+        return {
+            "body": body_id,
+            "geom": geom_id,
+            "joint": joint_id,
+            "qpos": int(self.model.jnt_qposadr[joint_id]),
+            "qvel": int(self.model.jnt_dofadr[joint_id]),
+            "equality": equality_id,
+        }
+
+    def _select_ball_variant(self, radius):
+        radius = float(radius)
+        if radius not in self.ball_variants:
+            raise ValueError(f"Unsupported precompiled ball radius: {radius}")
+        active = self.ball_variants[radius]
+        for variant_radius, variant in self.ball_variants.items():
+            geom_id = variant["geom"]
+            self.model.geom_rgba[geom_id] = self._ball_variant_rgba[geom_id]
+            self.model.geom_rgba[geom_id, 3] = 1.0 if variant_radius == radius else 0.0
+            if variant["equality"] >= 0:
+                self.data.eq_active[variant["equality"]] = variant_radius != radius
+        self.ball_body = active["body"]
+        self.ball_geom = active["geom"]
+        self.ball_joint = active["joint"]
+        self.ball_qpos = active["qpos"]
+        self.ball_qvel = active["qvel"]
+        self.ball_radius = radius
 
     def _gripper_touching_ball(self):
         for i in range(self.data.ncon):
@@ -161,7 +218,7 @@ class BallCupEnv:
             [
                 self.data.site_xpos[self.gripper_site], # gripper xyz
                 self.data.xpos[self.ball_body], # ball xyz
-                self.model.body_pos[self.cup_body], # cup xyz
+                self.data.xpos[self.cup_body], # cup xyz
                 self.data.qvel[self.ball_qvel:self.ball_qvel + 3], # ball velocity
                 joints
             ]
@@ -178,6 +235,7 @@ class BallCupEnv:
             self.rng = np.random.default_rng(seed)
 
         mujoco.mj_resetData(self.model, self.data)
+        self._select_ball_variant(self.ball_radius)
 
         gripper_actuator = self.actuator_ids[-1]
         open_angle = self.model.actuator_ctrlrange[gripper_actuator, 1]
@@ -187,12 +245,16 @@ class BallCupEnv:
         # Small randomized cup and ball positions, both on the tabletop.
         cup_x = self.rng.uniform(0.23, 0.27)
         cup_y = self.rng.uniform(0.11, 0.15)
-        self.model.body_pos[self.cup_body] = [cup_x, cup_y, 0.0]
+        cup_position = np.array([cup_x, cup_y, 0.0], dtype=np.float64)
+        if self.cup_mocap_id >= 0:
+            self.data.mocap_pos[self.cup_mocap_id] = cup_position
+        else:
+            self.model.body_pos[self.cup_body] = cup_position
 
         ball_x = self.rng.uniform(0.18, 0.32)
         ball_y = self.rng.uniform(-0.20, -0.08)
         self.data.qpos[self.ball_qpos:self.ball_qpos + 3] = [
-            ball_x, ball_y, 0.020
+            ball_x, ball_y, self.ball_radius
         ]
         self.data.qpos[self.ball_qpos + 3:self.ball_qpos + 7] = [
             1.0, 0.0, 0.0, 0.0
@@ -208,7 +270,7 @@ class BallCupEnv:
 
         gripper = self.data.site_xpos[self.gripper_site]
         ball = self.data.xpos[self.ball_body]
-        cup = self.model.body_pos[self.cup_body]
+        cup = self.data.xpos[self.cup_body]
         self.previous_gripper_ball_distance = np.linalg.norm(gripper - ball)
         self.previous_ball_cup_distance = np.linalg.norm(ball[:2] - cup[:2])
 
@@ -272,7 +334,7 @@ class BallCupEnv:
 
         gripper = self.data.site_xpos[self.gripper_site]
         ball = self.data.xpos[self.ball_body]
-        cup = self.model.body_pos[self.cup_body]
+        cup = self.data.xpos[self.cup_body]
         gripper_ball_distance = np.linalg.norm(gripper - ball)
         ball_cup_distance = np.linalg.norm(ball[:2] - cup[:2])
 

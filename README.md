@@ -18,3 +18,98 @@ One demo (ex: 15 seconds of dropping the cube in the cup) = hundreds of synchron
 
 # Status
 Validated the full training pipeline in simulation (ACT on the pusht dataset, trained on Apple MPS) before touching hardware — confirming the record→train→eval→plot loop works end to end. Real SO-101 data slots into the same pipeline unchanged.
+
+## MuJoCo PPO: SO-101 ball into cup
+
+The state-based PPO task uses the existing SO-101 MuJoCo model and its actual
+finger collision meshes. Run the environment checks before training:
+
+```bash
+.venv/bin/python -m experiments.validate_ppo_env
+.venv/bin/python -m experiments.train_ppo --smoke-test
+```
+
+### Environment contract
+
+- MuJoCo keeps the model's 2 ms timestep (500 Hz). The policy acts at 20 Hz,
+  with 25 physics steps per action and a 500-action / 25-second horizon.
+- Actions are six normalized values in `[-1, 1]`. The first five move the
+  shoulder pan, shoulder lift, elbow, wrist flex, and wrist roll targets by at
+  most 2 degrees relative to the current joint positions. Targets clip to the
+  model's actual joint limits. The sixth closes below `-0.5`, opens above
+  `+0.5`, and holds its previous target in between. Existing position servos
+  and their force limits remain in use.
+- The 25-value state contains all six joint positions, all six joint
+  velocities, gripper XYZ, ball XYZ, cup XYZ, the gripper's commanded state,
+  and the ball's linear velocity. PPO receives normalized state, not camera
+  pixels.
+- The arm starts at `[0, 0, 0, 0, 0]` radians with an open gripper. The model
+  joint ranges (radians) are shoulder pan `[-1.9199, 1.9199]`, shoulder lift
+  `[-1.7453, 1.7453]`, elbow `[-1.69, 1.69]`, wrist flex
+  `[-1.6581, 1.6581]`, and wrist roll `[-2.7438, 2.8412]`.
+- Stages 1–3 use the fixed 20 mm ball and nominal cup. Stage 2 samples the ball
+  within ±10 mm of the verified scene; Stage 3 also samples the cup within
+  ±10 mm. Stage 4 adds collision-rejected starting-joint jitter of ±2 degrees.
+  Stage 5 currently keeps the ball at 20 mm and samples 0.9, 1.0, or 1.1 cup
+  scales. Diagnostic probes at 19, 19.5, 20.5, 21, and 22 mm did not complete
+  the actual-gripper transfer reliably, so training does not sample those sizes.
+  The narrow XY boxes are centered on the prior successful scripted scene:
+  ball `(0.1857, -0.1980)` m and cup `(0.2555, 0.1208)` m.
+- Placement must follow a stable bilateral grasp and a lift above `z = 0.035`
+  m. Success also requires the full ball sphere to fit inside the octagonal
+  cup opening with 3 mm clearance, sit between the floor and rim, leave all
+  gripper contact, and remain settled for 0.25 seconds.
+
+The reward is a sum of signed approach progress (`4` per meter), one-time
+stable-grasp `+2`, one-time lift `+2`, new-best held transport progress (`8` per
+meter), one-time above-cup `+3`, one-time correct release `+5`, and terminal
+success `+50`. It subtracts one-time outside-drop `5`, unsafe collision `0.25`,
+joint-limit clipping at `0.1` times the clipped target delta divided by the
+2-degree action limit, `0.01` per action step,
+and unrecoverable failure `10`. Progress is signed or best-so-far; event bonuses
+are one-time, so hovering, oscillating, or repeating grasps cannot farm reward.
+All weights and thresholds are in `config/ppo_training.json`.
+
+PPO uses Stable-Baselines3 with a `[128, 128]` tanh MLP, learning rate
+`3e-4`, rollout length `2048`, minibatch `256`, 10 epochs, gamma `0.99`, GAE
+lambda `0.95`, clip `0.2`, entropy coefficient `0.01`, value coefficient
+`0.5`, and gradient norm `0.5`. Observation normalization is enabled; reward
+normalization is off so logged returns retain the configured reward scale.
+
+The short smoke test runs 128 PPO steps and two deterministic evaluation
+episodes. It does not launch the curriculum. To start the full five-stage
+curriculum when ready:
+
+```bash
+.venv/bin/python -m experiments.train_ppo
+```
+
+Checkpoints, Monitor episode CSV files, PPO's `progress.csv`, and deterministic
+evaluation results are written under `outputs/ball_cup_ppo/`. Curriculum
+advancement requires at least 100,000 training steps in a stage, then a 90%
+success rate over 50 deterministic episodes at three consecutive evaluations
+25,000 steps apart. A stage stops after 1,000,000 training steps if it has not
+passed. Training reward does not advance the curriculum.
+
+The randomization boxes are a conservative ±10 mm neighborhood of one
+verified scripted pick-and-place scene, not a complete IK-certified reachable
+workspace. Stage 4 checks sampled starts for robot contact at reset. The model
+uses the existing 2.7 g ball mass. Broader Stage 5 ball-size randomization is
+unresolved because the actual-gripper scripted transfer loses contact at tested
+radii other than 20 mm. Real servo velocity limits and camera-derived state
+uncertainty are not calibrated yet.
+
+Evaluate the final policy over ten Stage 5 episodes:
+
+```bash
+.venv/bin/python -m experiments.evaluate_ppo \
+  --model outputs/ball_cup_ppo/final_model.zip --stage 5 --episodes 10
+```
+
+On macOS, record the first episode as a GIF using MuJoCo's CGL renderer:
+
+```bash
+MUJOCO_GL=cgl .venv/bin/python -m experiments.evaluate_ppo \
+  --model outputs/ball_cup_ppo/final_model.zip --stage 5 --episodes 5 \
+  --video outputs/ball_cup_ppo/stage5_evaluation.gif
+```

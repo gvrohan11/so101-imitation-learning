@@ -3,10 +3,11 @@ import numpy as np
 from gymnasium import spaces
 
 from sim.ball_cup_env import BallCupEnv
+from sim.rl_env import BallCupTrainingEnv
 
 
-class StateOnlyBallCupEnv(gym.Env):
-    """Gymnasium interface exposing only simulator state observations."""
+class LegacyAbsoluteTargetBallCupEnv(gym.Env):
+    """Compatibility wrapper for the old absolute-target experiment."""
 
     metadata = {"render_modes": []}
 
@@ -36,3 +37,8 @@ class StateOnlyBallCupEnv(gym.Env):
 
     def close(self):
         self.env.close()
+
+
+# Keep the established import name, but route new policy code through the
+# physically bounded relative-joint task and its 25-value observation.
+StateOnlyBallCupEnv = BallCupTrainingEnv

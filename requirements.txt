@@ -3,3 +3,5 @@ matplotlib>=3.7
 gymnasium>=1.0
 mujoco>=3.2
 torch>=2.0
+stable-baselines3>=2.9.0,<3
+imageio>=2.34
