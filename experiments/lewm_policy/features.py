@@ -2,46 +2,67 @@
 
 from __future__ import annotations
 
-import importlib.util
-import sys
+import os
 from pathlib import Path
 
 import torch
 import torch.nn as nn
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 
+from .lewm_architecture import Encoder, ProjectionHead
 
-def _import_from_path(module_name: str, module_path: Path):
-    spec = importlib.util.spec_from_file_location(module_name, module_path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"Cannot import LeWM source file: {module_path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
-    return module
+
+def resolve_lewm_checkpoint(
+    checkpoint_path: str | Path | None = None,
+    lewm_repo: str | Path | None = None,
+) -> Path:
+    """Find the LeWM weights without requiring the training repo on this host."""
+    if checkpoint_path is not None:
+        requested = Path(checkpoint_path).expanduser().resolve()
+        if not requested.is_file():
+            raise FileNotFoundError(f"LeWM checkpoint not found: {requested}")
+        return requested
+
+    candidates = []
+    env_checkpoint = os.environ.get("LEWM_CHECKPOINT")
+    if env_checkpoint:
+        candidates.append(Path(env_checkpoint).expanduser())
+    if lewm_repo is not None:
+        candidates.append(Path(lewm_repo).expanduser() / "lewm_seq_projectors.pt")
+    project_root = Path(__file__).resolve().parents[2]
+    candidates.extend(
+        (
+            project_root / "lewm_seq_projectors.pt",
+            project_root / "weights" / "lewm_seq_projectors.pt",
+            Path.cwd() / "lewm_seq_projectors.pt",
+            Path.cwd() / "weights" / "lewm_seq_projectors.pt",
+        )
+    )
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved.is_file():
+            return resolved
+    locations = "\n".join(f"  - {path}" for path in candidates)
+    raise FileNotFoundError(
+        "Could not find lewm_seq_projectors.pt. Copy that checkpoint to this "
+        "machine or pass --checkpoint /path/to/lewm_seq_projectors.pt. Checked:\n"
+        f"{locations}"
+    )
 
 
 def make_lewm_backbone(
-    lewm_repo: str | Path,
+    lewm_repo: str | Path | None,
     checkpoint_path: str | Path,
 ) -> tuple[nn.Module, int]:
-    """Load the checkpoint's trained image encoder and training projection head."""
-    root = Path(lewm_repo).expanduser().resolve()
+    """Load the checkpoint's trained encoder and projection head."""
     checkpoint_file = Path(checkpoint_path).expanduser().resolve()
-    if not (root / "models" / "encoder.py").is_file():
-        raise FileNotFoundError(f"LeWM encoder source not found under {root}")
     if not checkpoint_file.is_file():
         raise FileNotFoundError(f"LeWM checkpoint not found: {checkpoint_file}")
-
-    tag = f"lewm_{abs(hash(str(root))):x}"
-    encoder_module = _import_from_path(tag + "_encoder", root / "models" / "encoder.py")
-    predictor_module = _import_from_path(
-        tag + "_predictor", root / "models" / "predictor2.py"
-    )
-    encoder = encoder_module.Encoder(
+    del lewm_repo  # Checkpoint-compatible model code is bundled in this package.
+    encoder = Encoder(
         img_size=224, patch=16, in_ch=3, dim=192, depth=12, heads=3, out_dim=192
     )
-    projection = predictor_module.ProjectionHead(192)
+    projection = ProjectionHead(192)
 
     # The checkpoint is a trusted local project artifact and contains the full
     # training state dictionary, not a TorchScript module.
@@ -121,8 +142,8 @@ class VisionProprioFeatures(BaseFeaturesExtractor):
     ):
         super().__init__(observation_space, features_dim)
         if visual_backbone == "lewm":
-            if lewm_repo is None or lewm_checkpoint is None:
-                raise ValueError("lewm_repo and lewm_checkpoint are required for LeWM")
+            if lewm_checkpoint is None:
+                raise ValueError("lewm_checkpoint is required for LeWM")
             self.visual, visual_dim = make_lewm_backbone(lewm_repo, lewm_checkpoint)
         elif visual_backbone == "resnet18":
             self.visual, visual_dim = make_resnet_backbone(
@@ -151,4 +172,3 @@ class VisionProprioFeatures(BaseFeaturesExtractor):
             visual_features = self.visual(image)
         state_features = self.state_net(state)
         return self.fusion(torch.cat((visual_features, state_features), dim=1))
-

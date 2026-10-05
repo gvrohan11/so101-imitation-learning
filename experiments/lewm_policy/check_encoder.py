@@ -12,17 +12,17 @@ import torch.nn.functional as F
 from PIL import Image
 
 from .env import BallCupVisionEnv
-from .features import make_lewm_backbone
-
-
-DEFAULT_LEWM_REPO = Path(
-    "/Users/rohan/Documents/Python-Projects/machine-learning/Le-World-Model-Implementation"
-)
+from .features import make_lewm_backbone, resolve_lewm_checkpoint
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--lewm-repo", type=Path, default=DEFAULT_LEWM_REPO)
+    parser.add_argument(
+        "--lewm-repo",
+        type=Path,
+        default=None,
+        help="Optional folder containing lewm_seq_projectors.pt.",
+    )
     parser.add_argument("--checkpoint", type=Path, default=None)
     parser.add_argument(
         "--image",
@@ -32,7 +32,7 @@ def main(argv=None):
     )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args(argv)
-    checkpoint = args.checkpoint or args.lewm_repo / "lewm_seq_projectors.pt"
+    checkpoint = resolve_lewm_checkpoint(args.checkpoint, args.lewm_repo)
 
     if args.image is None:
         env = BallCupVisionEnv(stage=1, seed=7)

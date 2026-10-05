@@ -14,23 +14,24 @@ Ball and cup world coordinates are deliberately excluded from the policy observa
 
 The default `lewm` backbone loads the existing `lewm_seq_projectors.pt` checkpoint and freezes its image encoder and trained projection head. PPO trains the state branch, fusion layer, actor, and critic. The action-conditioned predictor is not used to choose imagined actions: its current transition results did not establish an advantage over persistence. This experiment tests whether the checkpoint's visual representation helps this task; it does not retrain LeWM.
 
-For a controlled feature comparison, the same trainer accepts `--visual-backbone resnet18`. Both variants get the same camera images, robot-state fields, demonstrations, PPO settings, and evaluation seeds. ResNet defaults to ImageNet weights; use `--random-resnet` only for an explicitly untrained visual baseline.
+The inference-time definitions matching the LeWM encoder and projection head are included in this folder. RunPod does not need a clone of the LeWM source repository; it only needs the `.pt` checkpoint. For a controlled feature comparison, the same trainer accepts `--visual-backbone resnet18`. Both variants get the same camera images, robot-state fields, demonstrations, PPO settings, and evaluation seeds. ResNet defaults to ImageNet weights; use `--random-resnet` only for an explicitly untrained visual baseline.
 
 ## Run on RunPod
 
-From the SO-101 repository root, point at the LeWM checkout and checkpoint. On a headless Linux node, MuJoCo normally needs EGL:
+From the SO-101 repository root, point at the checkpoint file. On a headless Linux node, MuJoCo normally needs EGL:
 
 ```bash
 export MUJOCO_GL=egl
-LEWM_REPO=/workspace/Le-World-Model-Implementation
-CHECKPOINT="$LEWM_REPO/lewm_seq_projectors.pt"
+CHECKPOINT=/workspace/checkpoints/lewm_seq_projectors.pt
 ```
+
+Upload or copy the 207 MB `lewm_seq_projectors.pt` file to that path. The model code itself is bundled here, so there is no required `LEWM_REPO` path.
 
 First verify that an actual MuJoCo camera frame passes through the saved LeWM weights and yields finite 192-dimensional features. This does not train anything:
 
 ```bash
 .venv/bin/python -m experiments.lewm_policy.check_encoder \
-  --lewm-repo "$LEWM_REPO" --checkpoint "$CHECKPOINT" --device cuda
+  --checkpoint "$CHECKPOINT" --device cuda
 ```
 
 If running from a headless Mac shell that cannot create a CoreGraphics/OpenGL
@@ -39,7 +40,7 @@ camera frame in this repository:
 
 ```bash
 .venv/bin/python -m experiments.lewm_policy.check_encoder \
-  --lewm-repo "$LEWM_REPO" --checkpoint "$CHECKPOINT" \
+  --checkpoint "$CHECKPOINT" \
   --image results/ball_cup_camera.png --device cpu
 ```
 
@@ -53,8 +54,8 @@ Record a successful scripted episode with aligned RGB frames, robot state, and a
   --output outputs/lewm_policy/expert_demo.npz
 
 .venv/bin/python -m experiments.lewm_policy.train \
-  --visual-backbone lewm --lewm-repo "$LEWM_REPO" \
-  --checkpoint "$CHECKPOINT" --demo outputs/lewm_policy/expert_demo.npz \
+  --visual-backbone lewm --checkpoint "$CHECKPOINT" \
+  --demo outputs/lewm_policy/expert_demo.npz \
   --stage 1 --timesteps 250000 --device cuda
 ```
 
@@ -68,4 +69,4 @@ Run the ResNet comparison with the same demonstration and stage:
   --stage 1 --timesteps 250000 --device cuda
 ```
 
-The checkpoint remains in the LeWM repository; this folder does not copy the 207 MB file into Git. Supply its path again when loading/running the LeWM policy on another machine.
+The checkpoint is read from the path you pass; this folder does not copy the 207 MB file into Git. Supply its path again when loading/running the LeWM policy on another machine.

@@ -18,16 +18,11 @@ from stable_baselines3.common.vec_env import DummyVecEnv
 from sim.training_config import DEFAULT_CONFIG_PATH, load_training_config
 
 from .env import BallCupVisionEnv
-from .features import VisionProprioFeatures
+from .features import VisionProprioFeatures, resolve_lewm_checkpoint
 from .record_demo import record_demo
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_LEWM_REPO = Path(
-    "/Users/rohan/Documents/Python-Projects/machine-learning/Le-World-Model-Implementation"
-)
-
-
 def _demonstration_features(model: PPO, camera_images, robot_state, batch_size=32):
     device = model.device
     images = torch.as_tensor(camera_images, device=device).permute(0, 3, 1, 2)
@@ -186,7 +181,12 @@ class VisionEvaluationCallback(BaseCallback):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--visual-backbone", choices=("lewm", "resnet18"), default="lewm")
-    parser.add_argument("--lewm-repo", type=Path, default=DEFAULT_LEWM_REPO)
+    parser.add_argument(
+        "--lewm-repo",
+        type=Path,
+        default=None,
+        help="Optional folder containing lewm_seq_projectors.pt.",
+    )
     parser.add_argument("--checkpoint", type=Path, default=None)
     parser.add_argument("--demo", type=Path, default=None)
     parser.add_argument("--stage", type=int, choices=range(1, 6), default=1)
@@ -204,11 +204,13 @@ def main(argv=None):
     if int(config["task"]["control_hz"]) != 20 or float(config["task"]["arm_delta_degrees"]) != 2.0:
         raise ValueError("This policy path expects the configured 20 Hz / ±2 degree controls")
 
-    checkpoint = args.checkpoint or args.lewm_repo / "lewm_seq_projectors.pt"
+    checkpoint = (
+        resolve_lewm_checkpoint(args.checkpoint, args.lewm_repo)
+        if args.visual_backbone == "lewm"
+        else None
+    )
     demo_path = args.demo or PROJECT_ROOT / "outputs" / "lewm_policy" / "expert_demo.npz"
     if not demo_path.is_file():
-        if args.visual_backbone == "lewm" and not checkpoint.is_file():
-            raise FileNotFoundError(f"LeWM checkpoint not found: {checkpoint}")
         print(f"Recording successful scripted demonstration to {demo_path}")
         record_demo(args.config, demo_path, seed=int(config["seed"]))
 
@@ -234,7 +236,6 @@ def main(argv=None):
     checkpoint_kwargs = {}
     if args.visual_backbone == "lewm":
         checkpoint_kwargs = {
-            "lewm_repo": str(args.lewm_repo.resolve()),
             "lewm_checkpoint": str(checkpoint.resolve()),
         }
     policy_kwargs = {
@@ -249,25 +250,29 @@ def main(argv=None):
         "net_arch": {"pi": [512, 512], "vf": [512, 512]},
         "log_std_init": float(np.log(float(ppo["initial_action_std"]))),
     }
-    model = PPO(
-        "MultiInputPolicy",
-        vector_env,
-        learning_rate=float(ppo["learning_rate"]),
-        n_steps=int(ppo["rollout_steps"]),
-        batch_size=int(ppo["batch_size"]),
-        n_epochs=int(ppo["epochs"]),
-        gamma=float(ppo["gamma"]),
-        gae_lambda=float(ppo["gae_lambda"]),
-        clip_range=float(ppo["clip_range"]),
-        ent_coef=float(ppo["entropy_coefficient"]),
-        target_kl=float(ppo["target_kl"]),
-        max_grad_norm=float(ppo["max_gradient_norm"]),
-        policy_kwargs=policy_kwargs,
-        seed=int(config["seed"]),
-        device=args.device,
-        verbose=1,
-        tensorboard_log=str(output_dir / "tensorboard"),
-    )
+    try:
+        model = PPO(
+            "MultiInputPolicy",
+            vector_env,
+            learning_rate=float(ppo["learning_rate"]),
+            n_steps=int(ppo["rollout_steps"]),
+            batch_size=int(ppo["batch_size"]),
+            n_epochs=int(ppo["epochs"]),
+            gamma=float(ppo["gamma"]),
+            gae_lambda=float(ppo["gae_lambda"]),
+            clip_range=float(ppo["clip_range"]),
+            ent_coef=float(ppo["entropy_coefficient"]),
+            target_kl=float(ppo["target_kl"]),
+            max_grad_norm=float(ppo["max_gradient_norm"]),
+            policy_kwargs=policy_kwargs,
+            seed=int(config["seed"]),
+            device=args.device,
+            verbose=1,
+            tensorboard_log=str(output_dir / "tensorboard"),
+        )
+    except Exception:
+        vector_env.close()
+        raise
 
     bc_mse = behavior_clone_actor(
         model,
@@ -287,7 +292,7 @@ def main(argv=None):
         json.dumps(
             {
                 "visual_backbone": args.visual_backbone,
-                "lewm_checkpoint": str(checkpoint.resolve()) if args.visual_backbone == "lewm" else None,
+                "lewm_checkpoint": str(checkpoint) if checkpoint is not None else None,
                 "demo_path": str(demo_path.resolve()),
                 "demonstration_steps": len(demo_actions),
                 "behavior_cloning_action_mse": bc_mse,
@@ -340,4 +345,3 @@ def main(argv=None):
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
