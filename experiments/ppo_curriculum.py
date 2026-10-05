@@ -26,6 +26,7 @@ class CurriculumStageCallback(BaseCallback):
         maximum_steps: int,
         checkpoint_interval: int,
         global_best: dict,
+        maximum_consecutive_zero_grasp_evaluations: int = 3,
         config_path=None,
         verbose: int = 1,
     ):
@@ -40,12 +41,16 @@ class CurriculumStageCallback(BaseCallback):
         self.required_consecutive = int(required_consecutive)
         self.maximum_steps = int(maximum_steps)
         self.checkpoint_interval = int(checkpoint_interval)
+        self.maximum_consecutive_zero_grasp_evaluations = int(
+            maximum_consecutive_zero_grasp_evaluations
+        )
         self.global_best = global_best
         self.config_path = config_path
         self.stage_start_steps = 0
         self.last_checkpoint_steps = 0
         self.evaluation_index = 0
         self.consecutive_passes = 0
+        self.consecutive_zero_grasp_evaluations = 0
         self.best_stage_success_rate = -1.0
         self.outcome = "running"
 
@@ -97,6 +102,11 @@ class CurriculumStageCallback(BaseCallback):
             write_json_line(self.output_dir / "evaluations.jsonl", result)
 
             success_rate = result["success_rate"]
+            grasp_rate = result["phase_rates"].get("grasp_success", 0.0)
+            if grasp_rate <= 0.0:
+                self.consecutive_zero_grasp_evaluations += 1
+            else:
+                self.consecutive_zero_grasp_evaluations = 0
             if success_rate >= self.required_success_rate:
                 self.consecutive_passes += 1
             else:
@@ -135,6 +145,21 @@ class CurriculumStageCallback(BaseCallback):
             if self.consecutive_passes >= self.required_consecutive:
                 self.outcome = "passed"
                 self._save("latest_model")
+                return False
+
+            if (
+                self.maximum_consecutive_zero_grasp_evaluations > 0
+                and self.consecutive_zero_grasp_evaluations
+                >= self.maximum_consecutive_zero_grasp_evaluations
+            ):
+                self.outcome = "failed_no_grasp_progress"
+                self._save("latest_model")
+                if self.verbose:
+                    print(
+                        f"Stopping Stage {self.stage} after "
+                        f"{self.consecutive_zero_grasp_evaluations} consecutive "
+                        "evaluations with no stable grasp."
+                    )
                 return False
 
         if stage_steps >= self.maximum_steps:

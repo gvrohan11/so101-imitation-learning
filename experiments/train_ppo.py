@@ -20,6 +20,7 @@ from experiments.ppo_common import (
     run_deterministic_evaluation,
     save_bundle,
 )
+from experiments.anchored_ppo import DemonstrationAnchoredPPO
 from experiments.ppo_curriculum import CurriculumStageCallback
 from sim.expert_demo import generate_demonstration, save_demonstration
 from sim.rl_env import CLOCK_OBSERVATION_START
@@ -179,6 +180,7 @@ def run_smoke_test(config, config_path):
             gamma=float(ppo["gamma"]),
             gae_lambda=float(ppo["gae_lambda"]),
             clip_range=float(ppo["clip_range"]),
+            target_kl=float(ppo["target_kl"]),
             ent_coef=float(ppo["entropy_coefficient"]),
             vf_coef=float(ppo["value_coefficient"]),
             max_grad_norm=float(ppo["max_gradient_norm"]),
@@ -266,7 +268,7 @@ def run_training(config, config_path, output_dir, *, initialize_only=False):
         normalize=normalize,
         config_path=config_path,
     )
-    model = PPO(
+    model = DemonstrationAnchoredPPO(
         "MlpPolicy",
         first_env,
         learning_rate=float(ppo["learning_rate"]),
@@ -276,6 +278,7 @@ def run_training(config, config_path, output_dir, *, initialize_only=False):
         gamma=float(ppo["gamma"]),
         gae_lambda=float(ppo["gae_lambda"]),
         clip_range=float(ppo["clip_range"]),
+        target_kl=float(ppo["target_kl"]),
         ent_coef=float(ppo["entropy_coefficient"]),
         vf_coef=float(ppo["value_coefficient"]),
         max_grad_norm=float(ppo["max_gradient_norm"]),
@@ -290,6 +293,14 @@ def run_training(config, config_path, output_dir, *, initialize_only=False):
 
     initialization_metrics = initialize_actor_from_demonstration(
         model, demo_observations, demo_actions, ppo
+    )
+    # Preserve the successful behavior while PPO explores: keep action noise
+    # fixed and project the trained action head back onto the expert trajectory.
+    model.policy.log_std.requires_grad_(False)
+    model.set_demonstration_anchor(
+        demo_observations,
+        demo_actions,
+        ridge=float(ppo["demonstration_projection_ridge"]),
     )
     save_bundle(model, output_dir, "demonstration_initialized")
     warm_start_evaluation = run_deterministic_evaluation(
@@ -335,9 +346,25 @@ def run_training(config, config_path, output_dir, *, initialize_only=False):
         )
         return 0
 
-    global_best = {"success_rate": -1.0, "stage": 0}
-    stage_results = []
-    for stage in range(1, 6):
+    # Stage 1 is the fixed scene solved by the expert. Its 50-episode
+    # demonstration gate is the stage evaluation, so avoid an unnecessary PPO
+    # update that could erase this already successful behavior.
+    global_best = {
+        "success_rate": warm_start_evaluation["success_rate"],
+        "stage": 1,
+        "global_env_steps": 0,
+    }
+    stage_results = [{
+        "stage": 1,
+        "outcome": "passed_from_demonstration",
+        "steps": 0,
+        "consecutive_passing_evaluations": int(
+            curriculum["consecutive_passing_evaluations"]
+        ),
+        "best_evaluation_success_rate": warm_start_evaluation["success_rate"],
+    }]
+    save_bundle(model, output_dir, "best_model")
+    for stage in range(2, 6):
         if stage > 1:
             previous_env = model.get_env()
             previous_vec_normalize = model.get_vec_normalize_env()
@@ -370,6 +397,9 @@ def run_training(config, config_path, output_dir, *, initialize_only=False):
             maximum_steps=int(curriculum["maximum_steps_per_stage"]),
             checkpoint_interval=int(config["logging"]["checkpoint_interval_steps"]),
             global_best=global_best,
+            maximum_consecutive_zero_grasp_evaluations=int(
+                curriculum["maximum_consecutive_zero_grasp_evaluations"]
+            ),
             config_path=config_path,
         )
         stage_start = int(model.num_timesteps)
@@ -436,7 +466,7 @@ def main(argv=None):
     )
     parser.add_argument(
         "--initialize-only", action="store_true",
-        help="Generate and clone the expert demo, evaluate it, and stop before PPO",
+        help="Generate the expert demo, initialize/evaluate PPO, then stop before updates",
     )
     args = parser.parse_args(argv)
     config = load_training_config(args.config)

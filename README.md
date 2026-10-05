@@ -77,16 +77,24 @@ are one-time, so hovering, oscillating, or repeating grasps cannot farm reward.
 All weights and thresholds are in `config/ppo_training.json`.
 
 PPO uses Stable-Baselines3 with a 512-unit tanh actor layer and a `[512, 512]`
-value network, learning rate `3e-4`, rollout length `2048`, minibatch `256`,
-10 epochs, gamma `0.99`, GAE lambda `0.95`, clip `0.2`, entropy coefficient
-`0.001`, value coefficient `0.5`, and gradient norm `0.5`. Observation
-normalization is enabled; reward normalization is off so logged returns retain
-the configured reward scale.
+value network, learning rate `1e-5`, rollout length `2048`, minibatch `256`,
+5 epochs, target KL `0.01`, gamma `0.99`, GAE lambda `0.95`, clip `0.2`,
+value coefficient `0.5`, and gradient norm `0.5`. Action standard deviation
+starts at `0.05` and stays fixed. Observation normalization is enabled; reward
+normalization is off so logged returns retain the configured reward scale.
 
 Before PPO starts, the code generates a successful retimed expert episode at
 20 Hz, checks every arm action against the 2-degree bound, and initializes the
 actor's clock units from that action sequence. The deterministic Stage 1
-warm-start must reach at least 80% success over 10 episodes or training stops.
+warm-start must reach at least 90% success over 50 episodes or training stops.
+On a normal run, that verified demonstration marks fixed-scene Stage 1 as
+solved, so PPO starts with the randomized Stage 2 instead of unlearning the
+successful trajectory on Stage 1. After each PPO update, a ridge projection
+adjusts the actor's final action layer to match the expert actions on the
+demonstration states, with the smallest parameter change possible. It preserves
+the hidden state-feedback features PPO learns for randomized scenes. If any
+stage records no stable grasps across three consecutive evaluation windows,
+training stops early instead of spending the full million-step budget.
 Run this validation first; it saves the demonstration, policy, normalization
 statistics, and warm-start report without launching PPO:
 
@@ -103,7 +111,8 @@ passes, start the full five-stage curriculum with:
 ```
 
 Checkpoints, Monitor episode CSV files, PPO's `progress.csv`, and deterministic
-evaluation results are written under `outputs/ball_cup_ppo/`. Curriculum
+evaluation results are written under `outputs/ball_cup_ppo_anchored/`, separate
+from the failed run's existing logs. Curriculum
 advancement requires at least 100,000 training steps in a stage, then a 90%
 success rate over 50 deterministic episodes at three consecutive evaluations
 25,000 steps apart. A stage stops after 1,000,000 training steps if it has not
@@ -121,13 +130,13 @@ Evaluate the final policy over ten Stage 5 episodes:
 
 ```bash
 .venv/bin/python -m experiments.evaluate_ppo \
-  --model outputs/ball_cup_ppo/final_model.zip --stage 5 --episodes 10
+  --model outputs/ball_cup_ppo_anchored/final_model.zip --stage 5 --episodes 10
 ```
 
 On macOS, record the first episode as a GIF using MuJoCo's CGL renderer:
 
 ```bash
 MUJOCO_GL=cgl .venv/bin/python -m experiments.evaluate_ppo \
-  --model outputs/ball_cup_ppo/final_model.zip --stage 5 --episodes 5 \
-  --video outputs/ball_cup_ppo/stage5_evaluation.gif
+  --model outputs/ball_cup_ppo_anchored/final_model.zip --stage 5 --episodes 5 \
+  --video outputs/ball_cup_ppo_anchored/stage5_evaluation.gif
 ```
