@@ -66,28 +66,32 @@ finger collision meshes. Run the environment checks before training:
   gripper contact, and remain settled for 0.25 seconds.
 
 The reward is a sum of signed approach progress (`40` per meter), one-time
-stable-grasp `+2`, one-time lift `+2`, new-best held transport progress (`40`
-per meter), one-time above-cup `+3`, one-time correct release `+5`, and terminal
-success `+50`. It subtracts one-time outside-drop `5`, unsafe collision `0.25`,
+grasp-pose reach `+3`, stable-grasp `+2`, signed ball-lift progress (`80` per
+meter, capped at the lift threshold), one-time lift `+2`, new-best held
+transport progress (`40` per meter), one-time above-cup `+3`, one-time correct
+release `+5`, and terminal success `+50`. It subtracts one-time outside-drop `5`, unsafe collision `0.25`,
 joint-limit clipping at `0.1` times the clipped target delta divided by the
 2-degree action limit, `0.01` per action step, and unrecoverable failure `10`.
 Progress is signed or best-so-far; event bonuses are one-time, so hovering,
 oscillating, or repeating grasps cannot farm reward. All weights and thresholds
 are in `config/ppo_training.json`.
 
-PPO uses Stable-Baselines3 with randomly initialized `[512, 512]` tanh actor and
-critic networks. It starts from Stage 1 with no scripted demonstration, clock
-lookup initialization, or action anchoring. The initial action standard
-deviation is `0.25` and trainable; observation normalization is enabled and
-reward normalization is off. Dense approach and transport progress rewards
-guide learning before the terminal placement reward.
+PPO uses Stable-Baselines3 with randomly initialized `[512, 512]` tanh actor
+and critic networks. Training starts from Stage 1 and learns from environment
+rewards; the hardcoded expert is not used to initialize, update, evaluate, or
+pass the policy. PPO starts with a trainable action standard deviation of
+`0.25`, uses `gamma = 0.995` and `GAE lambda = 0.98` to carry credit farther
+across the pick-and-place horizon, and keeps entropy regularization enabled.
+Observation normalization is enabled and reward normalization is off.
+Dense approach, grasp-pose, lift, and transport rewards guide PPO before the
+terminal placement reward.
 
 Every stage must reach 90% success over 50 evaluation episodes at three
-consecutive evaluation windows before the curriculum advances. Stage 1 is
-trained from scratch on the fixed scene. Stage 2 randomizes the ball, Stage 3
-also randomizes the cup, Stage 4 adds start-joint jitter, and Stage 5 adds cup
-size variation. Stage 1 is allowed its full budget even if early evaluations
-have no grasps. Later stages retain the zero-grasp early-stop safeguard.
+consecutive evaluation windows before the curriculum advances. Stage 1 trains
+PPO from scratch on the fixed scene. Stage 2 randomizes the ball, Stage 3 also
+randomizes the cup, Stage 4 adds start-joint jitter, and Stage 5 adds cup size
+variation. Stage 1 is allowed its full budget even if early evaluations have
+no grasps. Later stages retain the zero-grasp early-stop safeguard.
 
 Run a short PPO train/evaluate/checkpoint-reload smoke test, then launch the
 full five-stage curriculum:
@@ -102,7 +106,7 @@ full five-stage curriculum:
 
 The smoke test runs 128 PPO steps and two deterministic evaluation episodes; it
 does not launch the curriculum. The full command starts a new, timestamped run
-under `outputs/ball_cup_ppo_from_scratch/`, so evaluations cannot be mixed with
+under `outputs/ball_cup_ppo_state_feedback/`, so evaluations cannot be mixed with
 older runs. Checkpoints, Monitor episode CSV files, PPO's `progress.csv`, and
 deterministic evaluation results are saved there. Each stage is capped at
 1,000,000 steps, with evaluations every 25,000 steps after the first 100,000.
@@ -130,3 +134,21 @@ MUJOCO_GL=cgl .venv/bin/python -m experiments.evaluate_ppo \
   --model outputs/ball_cup_ppo_anchored/final_model.zip --stage 5 --episodes 5 \
   --video outputs/ball_cup_ppo_anchored/stage5_evaluation.gif
 ```
+
+# Hardcoded Demo Capability Check
+
+This scripted rollout checks that the MuJoCo scene, gripper, and placement
+task are physically solvable. It is a diagnostic only; `experiments.train_ppo`
+does not consume its actions or use its success as a curriculum pass.
+
+export MUJOCO_GL=egl
+.venv/bin/python -m sim.diagnose_grasp_candidate
+
+## Candidate Video
+
+SO101_RECORD_CANDIDATE_VIDEO=1 .venv/bin/python -m sim.diagnose_grasp_candidate
+
+# Running PPO Training
+
+export MUJOCO_GL=egl
+.venv/bin/python -m experiments.train_ppo

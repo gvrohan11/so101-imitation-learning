@@ -32,8 +32,7 @@ def _make_policy_kwargs(config, *, smoke=False):
     if not layers or any(int(width) <= 0 for width in layers):
         raise ValueError("policy_layers must contain positive hidden widths")
     return {
-        # Both actor and critic learn from the complete physical state. There is
-        # no clock-to-action lookup or demonstration-specific initialization.
+        # Both networks learn directly from physical state and PPO rewards.
         "net_arch": {"pi": layers, "vf": layers},
         "activation_fn": nn.Tanh,
         "log_std_init": float(np.log(config["initial_action_std"])),
@@ -130,7 +129,7 @@ def run_training(config, config_path, output_dir):
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Run artifacts: {output_dir}")
-    print("Starting fresh PPO training with a randomly initialized policy.")
+    print("Starting PPO from a random policy; demonstrations are not used for training.")
     run_metadata = {
         "training_mode": "ppo_from_scratch",
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -143,6 +142,7 @@ def run_training(config, config_path, output_dir):
         "scripted_demonstration_used": False,
         "pretrained_policy_used": False,
         "demonstration_action_anchor_used": False,
+        "open_loop_clock_lookup_used": False,
         "config": config,
     }
     (output_dir / "run_metadata.json").write_text(
@@ -222,7 +222,7 @@ def run_training(config, config_path, output_dir):
         stage_start = int(model.num_timesteps)
         print(
             f"\nStarting curriculum stage {stage}/5; "
-            "no scripted demonstration or action anchoring; "
+            "training the state-feedback PPO actor from rewards only; "
             f"minimum={curriculum['minimum_steps_per_stage']:,} steps, "
             f"evaluation={curriculum['evaluation_episodes']} episodes every "
             f"{curriculum['evaluation_interval_steps']:,} steps, "

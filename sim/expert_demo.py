@@ -526,11 +526,8 @@ class _RetimedExpert:
         }
 
 
-def generate_demonstration(
-    config_path=None, *, seed=None, execution_action_noise_std=0.0
-):
+def find_verified_grasp_candidate(config_path=None):
     config = load_training_config(config_path)
-    ball_radius = 0.020
     with contextlib.redirect_stdout(io.StringIO()):
         candidates = search_safe_pinch_candidates()
     if not candidates:
@@ -546,9 +543,24 @@ def generate_demonstration(
         raise RuntimeError("Training wrist-flex target disagrees with the validated grasp")
     if not np.isclose(float(candidate[2]), config["task"]["grasp_wrist_roll_rad"]):
         raise RuntimeError("Training wrist-roll target disagrees with the validated grasp")
+    return candidate
+
+
+def generate_demonstration(
+    config_path=None,
+    *,
+    seed=None,
+    execution_action_noise_std=0.0,
+    stage=1,
+    candidate=None,
+):
+    config = load_training_config(config_path)
+    if candidate is None:
+        candidate = find_verified_grasp_candidate(config_path)
+    ball_radius = 0.020
 
     env = BallCupTrainingEnv(
-        stage=1,
+        stage=stage,
         seed=int(config["seed"] if seed is None else seed),
         config_path=config_path,
     )
@@ -566,6 +578,80 @@ def generate_demonstration(
     metadata["ball_radius_m"] = ball_radius
     metadata["execution_action_noise_std"] = float(execution_action_noise_std)
     return observations, actions, metadata
+
+
+def generate_demonstration_set(
+    config_path=None,
+    *,
+    episodes=8,
+    seed=None,
+    execution_action_noise_std=0.10,
+    stage=1,
+    maximum_attempts_per_episode=5,
+):
+    """Collect corrective state/action labels from noisy expert rollouts."""
+    config = load_training_config(config_path)
+    candidate = find_verified_grasp_candidate(config_path)
+    first_seed = int(config["seed"] if seed is None else seed)
+    env = BallCupTrainingEnv(
+        stage=stage,
+        seed=first_seed,
+        config_path=config_path,
+    )
+    observation_rows = []
+    action_rows = []
+    episode_metadata = []
+    try:
+        for episode_index in range(int(episodes)):
+            last_error = None
+            for attempt in range(int(maximum_attempts_per_episode)):
+                episode_seed = (
+                    first_seed
+                    + episode_index * int(maximum_attempts_per_episode)
+                    + attempt
+                )
+                teacher = _RetimedExpert(
+                    env,
+                    candidate,
+                    execution_action_noise_std=execution_action_noise_std,
+                )
+                try:
+                    observations, actions, metadata = teacher.run(episode_seed)
+                except RuntimeError as error:
+                    last_error = error
+                    continue
+                if not metadata["success"] or not all(
+                    metadata["phase_success"].values()
+                ):
+                    last_error = RuntimeError(
+                        "Expert rollout did not complete every placement phase"
+                    )
+                    continue
+                observation_rows.append(observations)
+                action_rows.append(actions)
+                metadata["episode_index"] = episode_index
+                metadata["attempt"] = attempt + 1
+                episode_metadata.append(metadata)
+                break
+            else:
+                raise RuntimeError(
+                    f"Could not collect expert episode {episode_index + 1}/"
+                    f"{episodes} after {maximum_attempts_per_episode} attempts: "
+                    f"{last_error}"
+                )
+    finally:
+        env.close()
+
+    return (
+        np.concatenate(observation_rows, axis=0).astype(np.float32),
+        np.concatenate(action_rows, axis=0).astype(np.float32),
+        {
+            "stage": int(stage),
+            "episodes": episode_metadata,
+            "total_steps": int(sum(len(actions) for actions in action_rows)),
+            "execution_action_noise_std": float(execution_action_noise_std),
+        },
+    )
 
 
 def save_demonstration(path, observations, actions, metadata):

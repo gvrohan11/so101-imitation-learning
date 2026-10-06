@@ -383,12 +383,15 @@ class BallCupTrainingEnv(gym.Env):
         self.reward_totals = {
             name: 0.0
             for name in (
-                "reach_progress", "grasp", "lift", "transport_progress",
+                "reach_progress", "reach_pose", "grasp", "lift_progress",
+                "lift",
+                "transport_progress",
                 "above_cup", "correct_release", "success",
                 "dropped_outside_cup", "unsafe_contact", "joint_limit",
                 "time", "failure",
             )
         }
+        self._previous_lift_progress = 0.0
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
@@ -496,6 +499,18 @@ class BallCupTrainingEnv(gym.Env):
         position_error = float(np.linalg.norm(ee - contact))
         return path_distance + orientation_distance, position_error, float(
             np.linalg.norm(wrist_error)
+        )
+
+    def _lift_progress_potential(self) -> float:
+        """Bounded ball-height potential from the tabletop to lift success."""
+        ball_z = float(self.data.xpos[self.sim.ball_body, 2])
+        required_height = float(self.task["lift_threshold_z_m"])
+        return float(
+            np.clip(
+                ball_z - self.ball_radius,
+                0.0,
+                required_height - self.ball_radius,
+            )
         )
 
     def _cup_dimensions(self):
@@ -623,6 +638,7 @@ class BallCupTrainingEnv(gym.Env):
             self.data.ctrl[actuator_id] = targets[joint_index]
         self.data.ctrl[self.sim.actuator_ids[5]] = gripper_target
 
+        previously_reached = self.reach_success
         previously_grasped = self.grasp_success
         previously_lifted = self.lift_success
         previously_above_cup = self.above_cup_success
@@ -728,8 +744,19 @@ class BallCupTrainingEnv(gym.Env):
                 )
             self._previous_approach_distance = approach_distance
 
+            if self.reach_success and not previously_reached:
+                reward_terms["reach_pose"] = float(
+                    self.reward_config["reach_pose_once"]
+                )
             if self.grasp_success and not previously_grasped:
                 reward_terms["grasp"] = float(self.reward_config["grasp_once"])
+            if self.grasp_success:
+                lift_progress = self._lift_progress_potential()
+                reward_terms["lift_progress"] = float(
+                    self.reward_config["lift_progress_per_meter"]
+                    * (lift_progress - self._previous_lift_progress)
+                )
+                self._previous_lift_progress = lift_progress
             if self.lift_success and not previously_lifted:
                 reward_terms["lift"] = float(self.reward_config["lift_once"])
 
