@@ -14,7 +14,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from sim.rl_env import BallCupTrainingEnv, CLOCK_OBSERVATION_START
+from sim.rl_env import BallCupTrainingEnv, OBSERVATION_SIZE
 from sim.training_config import load_training_config
 
 
@@ -270,9 +270,7 @@ def main():
     random_result = validate_random_rollouts()
     print(json.dumps({
         "gymnasium_env_checker": "passed",
-        "observation_shape": [
-            CLOCK_OBSERVATION_START + int(config["task"]["episode_steps"])
-        ],
+        "observation_shape": [OBSERVATION_SIZE],
         "action_shape": [6],
         "action_mapping_and_joint_limits": "passed",
         "gripper_open_close_motion": "passed",

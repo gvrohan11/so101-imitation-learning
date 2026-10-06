@@ -6,6 +6,7 @@ import argparse
 import copy
 import json
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -13,147 +14,29 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.logger import configure
 from stable_baselines3.common.vec_env import VecNormalize
 from torch import nn
-import torch
 
 from experiments.ppo_common import (
     make_vec_env,
     run_deterministic_evaluation,
     save_bundle,
 )
-from experiments.anchored_ppo import DemonstrationAnchoredPPO
 from experiments.ppo_curriculum import CurriculumStageCallback
-from sim.expert_demo import generate_demonstration, save_demonstration
-from sim.rl_env import CLOCK_OBSERVATION_START
 from sim.training_config import DEFAULT_CONFIG_PATH, load_training_config
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
-def _make_policy_kwargs(config, *, smoke=False, horizon=None):
+def _make_policy_kwargs(config, *, smoke=False):
     layers = [32, 32] if smoke else list(config["policy_layers"])
-    if smoke:
-        actor_layers = layers
-        critic_layers = layers
-    else:
-        if not layers:
-            raise ValueError("policy_layers must contain a positive hidden width")
-        clock_width = int(horizon or config.get("episode_steps", 0))
-        actor_layers = [max(int(layers[0]), clock_width)]
-        critic_layers = layers
+    if not layers or any(int(width) <= 0 for width in layers):
+        raise ValueError("policy_layers must contain positive hidden widths")
     return {
-        # The actor's first hidden layer has one unit per policy timestep. The
-        # demonstration initializer maps the one-hot clock to its exact action
-        # with this layer; PPO can then learn state feedback in those same units.
-        "net_arch": {"pi": actor_layers, "vf": critic_layers},
+        # Both actor and critic learn from the complete physical state. There is
+        # no clock-to-action lookup or demonstration-specific initialization.
+        "net_arch": {"pi": layers, "vf": layers},
         "activation_fn": nn.Tanh,
         "log_std_init": float(np.log(config["initial_action_std"])),
-    }
-
-
-def initialize_actor_from_demonstration(model, observations, actions, config):
-    """Initialize a one-hidden-layer PPO actor to replay a retimed demonstration."""
-    policy = model.policy
-    vec_normalize = model.get_vec_normalize_env()
-    observations = np.asarray(observations, dtype=np.float32)
-    actions = np.asarray(actions, dtype=np.float32)
-    if vec_normalize is not None:
-        vec_normalize.obs_rms.update(np.asarray(observations, dtype=np.float64))
-        normalized_observations = vec_normalize.normalize_obs(observations)
-        mean = np.asarray(vec_normalize.obs_rms.mean, dtype=np.float64)
-        std = np.sqrt(
-            np.asarray(vec_normalize.obs_rms.var, dtype=np.float64)
-            + float(vec_normalize.epsilon)
-        )
-        clip = float(vec_normalize.clip_obs)
-    else:
-        normalized_observations = observations.copy()
-        mean = np.zeros(observations.shape[1], dtype=np.float64)
-        std = np.ones(observations.shape[1], dtype=np.float64)
-        clip = float("inf")
-
-    # rl_env observation layout: 22 physical state values, one scalar time
-    # fraction, then one-hot timestep. The cloned action schedule depends only
-    # on this clock; PPO is free to learn state feedback after initialization.
-    clock_start = CLOCK_OBSERVATION_START
-    horizon = observations.shape[1] - clock_start
-    if horizon <= 0 or len(actions) > horizon:
-        raise ValueError(
-            f"Expected clock features after observation index {clock_start}; "
-            f"got observation shape {observations.shape} and {len(actions)} actions"
-        )
-    hidden = policy.mlp_extractor.policy_net
-    if len(hidden) != 2 or not isinstance(hidden[0], nn.Linear):
-        raise ValueError("Demonstration actor requires one Linear+Tanh hidden layer")
-    clock_width = hidden[0].out_features
-    if clock_width < horizon:
-        raise ValueError(
-            f"Actor width {clock_width} is too small for the {horizon}-step clock"
-        )
-    if not isinstance(policy.action_net, nn.Linear):
-        raise ValueError("Demonstration actor requires a linear PPO action head")
-
-    raw_inactive = np.zeros(horizon, dtype=np.float64)
-    raw_active = np.eye(horizon, dtype=np.float64)
-    clock_mean = mean[clock_start:clock_start + horizon]
-    clock_std = std[clock_start:clock_start + horizon]
-    inactive = np.clip((raw_inactive - clock_mean) / clock_std, -clip, clip)
-    active = np.clip((raw_active - clock_mean) / clock_std, -clip, clip)
-    activation_delta = active.diagonal() - inactive
-    if np.any(np.abs(activation_delta) < 1e-6):
-        raise ValueError("Normalized one-hot clock features are not distinguishable")
-
-    # A tanh unit marks each clock index: inactive clock bits sit below its
-    # midpoint and the active bit sits above it. The linear action head then
-    # maps each clock index to its recorded six-dimensional action exactly.
-    first = hidden[0]
-    action_head = policy.action_net
-    target_actions = np.zeros((horizon, actions.shape[1]), dtype=np.float32)
-    target_actions[:len(actions)] = actions
-    with torch.no_grad():
-        first.weight.zero_()
-        first.bias.zero_()
-        indices = torch.arange(horizon, device=model.device)
-        clock_columns = torch.arange(
-            clock_start, clock_start + horizon, device=model.device
-        )
-        first.weight[indices, clock_columns] = 1.0
-        midpoint = 0.5 * (inactive + active.diagonal())
-        first.bias[indices] = torch.as_tensor(
-            -midpoint, dtype=first.bias.dtype, device=model.device
-        )
-
-        inactive_hidden = np.tanh(inactive - midpoint)
-        active_hidden = np.tanh(active.diagonal() - midpoint)
-        hidden_delta = active_hidden - inactive_hidden
-        lookup_weights = target_actions.T / hidden_delta[None, :]
-        action_head.weight.zero_()
-        action_head.bias.zero_()
-        action_head.weight[:, :horizon] = torch.as_tensor(
-            lookup_weights, dtype=action_head.weight.dtype, device=model.device
-        )
-        action_head.bias.copy_(-action_head.weight[:, :horizon] @ torch.as_tensor(
-            inactive_hidden, dtype=action_head.weight.dtype, device=model.device
-        ))
-
-    policy.set_training_mode(False)
-    with torch.no_grad():
-        expert_tensor = torch.as_tensor(
-            normalized_observations, dtype=torch.float32, device=model.device
-        )
-        predicted = policy.get_distribution(expert_tensor).distribution.mean
-        final_mse = float(
-            torch.mean((predicted - torch.as_tensor(
-                actions, dtype=torch.float32, device=model.device
-            )) ** 2).cpu()
-        )
-    return {
-        "method": "one_hidden_layer_clock_lookup",
-        "demonstration_action_mse": final_mse,
-        "state_feedback_initialized_from_demo": False,
-        "initial_action_std": float(config["initial_action_std"]),
-        "clock_steps_encoded": int(horizon),
-        "demonstration_steps": int(len(actions)),
     }
 
 
@@ -184,7 +67,7 @@ def run_smoke_test(config, config_path):
             ent_coef=float(ppo["entropy_coefficient"]),
             vf_coef=float(ppo["value_coefficient"]),
             max_grad_norm=float(ppo["max_gradient_norm"]),
-            policy_kwargs=_make_policy_kwargs(ppo, smoke=True, horizon=50),
+            policy_kwargs=_make_policy_kwargs(ppo, smoke=True),
             seed=int(config["seed"]),
             verbose=0,
             device="cpu",
@@ -234,31 +117,36 @@ def run_smoke_test(config, config_path):
         }, indent=2))
 
 
-def run_training(config, config_path, output_dir, *, initialize_only=False):
+def run_training(config, config_path, output_dir):
     curriculum = config["curriculum"]
     ppo = config["ppo"]
     seed = int(config["seed"])
     normalize = bool(ppo["normalize_observations"])
+    if output_dir.exists() and any(output_dir.iterdir()):
+        raise FileExistsError(
+            f"Refusing to mix a fresh PPO run with existing output files: {output_dir}. "
+            "Choose a new --output-dir or move the old run first."
+        )
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print("Generating a full pick-and-place demonstration at the PPO control rate...")
-    demo_observations, demo_actions, demo_metadata = generate_demonstration(
-        config_path, seed=seed
-    )
-    if not demo_metadata["success"] or not all(
-        demo_metadata["phase_success"].values()
-    ):
-        raise RuntimeError("Refusing to train from an unsuccessful expert demonstration")
-    demo_path = save_demonstration(
-        output_dir / "demonstration_stage01.npz",
-        demo_observations,
-        demo_actions,
-        demo_metadata,
-    )
-    print(
-        f"Saved successful {demo_metadata['steps']}-step, "
-        f"{demo_metadata['control_hz']} Hz demonstration to {demo_path}; "
-        "all arm commands respect the configured 2-degree limit."
+    print(f"Run artifacts: {output_dir}")
+    print("Starting fresh PPO training with a randomly initialized policy.")
+    run_metadata = {
+        "training_mode": "ppo_from_scratch",
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "seed": seed,
+        "stage_order": [1, 2, 3, 4, 5],
+        "observation_size": 25,
+        "policy_layers": list(ppo["policy_layers"]),
+        "initial_action_std": float(ppo["initial_action_std"]),
+        "learning_rate": float(ppo["learning_rate"]),
+        "scripted_demonstration_used": False,
+        "pretrained_policy_used": False,
+        "demonstration_action_anchor_used": False,
+        "config": config,
+    }
+    (output_dir / "run_metadata.json").write_text(
+        json.dumps(run_metadata, indent=2), encoding="utf-8"
     )
 
     first_env = make_vec_env(
@@ -268,7 +156,7 @@ def run_training(config, config_path, output_dir, *, initialize_only=False):
         normalize=normalize,
         config_path=config_path,
     )
-    model = DemonstrationAnchoredPPO(
+    model = PPO(
         "MlpPolicy",
         first_env,
         learning_rate=float(ppo["learning_rate"]),
@@ -282,89 +170,16 @@ def run_training(config, config_path, output_dir, *, initialize_only=False):
         ent_coef=float(ppo["entropy_coefficient"]),
         vf_coef=float(ppo["value_coefficient"]),
         max_grad_norm=float(ppo["max_gradient_norm"]),
-        policy_kwargs=_make_policy_kwargs(
-            ppo, horizon=int(config["task"]["episode_steps"])
-        ),
+        policy_kwargs=_make_policy_kwargs(ppo),
         seed=seed,
         verbose=1,
-        device="auto",
+        device="cpu",
     )
     model.set_logger(configure(str(output_dir / "sb3_logs"), ["stdout", "csv"]))
-
-    initialization_metrics = initialize_actor_from_demonstration(
-        model, demo_observations, demo_actions, ppo
-    )
-    # Preserve the successful behavior while PPO explores: keep action noise
-    # fixed and project the trained action head back onto the expert trajectory.
-    model.policy.log_std.requires_grad_(False)
-    model.set_demonstration_anchor(
-        demo_observations,
-        demo_actions,
-        ridge=float(ppo["demonstration_projection_ridge"]),
-    )
-    save_bundle(model, output_dir, "demonstration_initialized")
-    warm_start_evaluation = run_deterministic_evaluation(
-        model,
-        model.get_vec_normalize_env(),
-        stage=1,
-        episodes=int(ppo["warm_start_evaluation_episodes"]),
-        seed=seed + 5_000_000,
-        config_path=config_path,
-    )
-    warm_start_summary = {
-        "demonstration_path": str(demo_path),
-        "demonstration": demo_metadata,
-        "actor_initialization": initialization_metrics,
-        "deterministic_stage_1_evaluation": warm_start_evaluation,
-    }
-    (output_dir / "demonstration_warm_start.json").write_text(
-        json.dumps(warm_start_summary, indent=2), encoding="utf-8"
-    )
-    print(
-        "Demonstration-initialized actor: "
-        f"demonstration action MSE "
-        f"{initialization_metrics['demonstration_action_mse']:.2e}; "
-        f"stage-1 success {warm_start_evaluation['successes']}/"
-        f"{warm_start_evaluation['episodes']} "
-        f"({warm_start_evaluation['success_rate']:.0%})."
-    )
-    minimum_warm_start_rate = float(ppo["minimum_warm_start_success_rate"])
-    if warm_start_evaluation["success_rate"] < minimum_warm_start_rate:
-        first_env.close()
-        raise RuntimeError(
-            "Demonstration-initialized policy failed its pre-training gate: "
-            f"{warm_start_evaluation['success_rate']:.0%} success is below "
-            f"the configured {minimum_warm_start_rate:.0%} minimum. "
-            "PPO was not started. Inspect demonstration_warm_start.json."
-        )
-    if initialize_only:
-        first_env.close()
-        print(
-            "Initialization-only run passed. The demonstration and initialized policy, "
-            "normalization statistics, and warm-start evaluation are saved; "
-            "the PPO curriculum was not started."
-        )
-        return 0
-
-    # Stage 1 is the fixed scene solved by the expert. Its 50-episode
-    # demonstration gate is the stage evaluation, so avoid an unnecessary PPO
-    # update that could erase this already successful behavior.
-    global_best = {
-        "success_rate": warm_start_evaluation["success_rate"],
-        "stage": 1,
-        "global_env_steps": 0,
-    }
-    stage_results = [{
-        "stage": 1,
-        "outcome": "passed_from_demonstration",
-        "steps": 0,
-        "consecutive_passing_evaluations": int(
-            curriculum["consecutive_passing_evaluations"]
-        ),
-        "best_evaluation_success_rate": warm_start_evaluation["success_rate"],
-    }]
-    save_bundle(model, output_dir, "best_model")
-    for stage in range(2, 6):
+    save_bundle(model, output_dir, "initial_model")
+    global_best = {"success_rate": 0.0, "stage": 1, "global_env_steps": 0}
+    stage_results = []
+    for stage in range(1, 6):
         if stage > 1:
             previous_env = model.get_env()
             previous_vec_normalize = model.get_vec_normalize_env()
@@ -398,13 +213,16 @@ def run_training(config, config_path, output_dir, *, initialize_only=False):
             checkpoint_interval=int(config["logging"]["checkpoint_interval_steps"]),
             global_best=global_best,
             maximum_consecutive_zero_grasp_evaluations=int(
-                curriculum["maximum_consecutive_zero_grasp_evaluations"]
+                0
+                if stage == 1
+                else curriculum["maximum_consecutive_zero_grasp_evaluations"]
             ),
             config_path=config_path,
         )
         stage_start = int(model.num_timesteps)
         print(
             f"\nStarting curriculum stage {stage}/5; "
+            "no scripted demonstration or action anchoring; "
             f"minimum={curriculum['minimum_steps_per_stage']:,} steps, "
             f"evaluation={curriculum['evaluation_episodes']} episodes every "
             f"{curriculum['evaluation_interval_steps']:,} steps, "
@@ -428,6 +246,7 @@ def run_training(config, config_path, output_dir, *, initialize_only=False):
         })
         (output_dir / "training_summary.json").write_text(
             json.dumps({
+                "training_mode": "ppo_from_scratch",
                 "stages": stage_results,
                 "global_best": global_best,
                 "final_global_steps": int(model.num_timesteps),
@@ -464,10 +283,6 @@ def main(argv=None):
         "--smoke-test", action="store_true",
         help="Run 128 PPO steps plus a two-episode check, never the curriculum",
     )
-    parser.add_argument(
-        "--initialize-only", action="store_true",
-        help="Generate the expert demo, initialize/evaluate PPO, then stop before updates",
-    )
     args = parser.parse_args(argv)
     config = load_training_config(args.config)
     config_path = Path(args.config)
@@ -476,12 +291,13 @@ def main(argv=None):
     if args.smoke_test:
         run_smoke_test(config, config_path)
         return 0
-    output_dir = args.output_dir or (PROJECT_ROOT / config["logging"]["output_directory"])
+    output_dir = args.output_dir
+    if output_dir is None:
+        run_id = datetime.now(timezone.utc).strftime("run_%Y%m%d_%H%M%S_%f_utc")
+        output_dir = PROJECT_ROOT / config["logging"]["output_directory"] / run_id
     if not output_dir.is_absolute():
         output_dir = PROJECT_ROOT / output_dir
-    return run_training(
-        config, config_path, output_dir, initialize_only=args.initialize_only
-    )
+    return run_training(config, config_path, output_dir)
 
 
 if __name__ == "__main__":

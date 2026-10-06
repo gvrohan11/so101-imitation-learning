@@ -16,7 +16,7 @@ from sim.training_config import load_training_config
 ARM_JOINT_NAMES = JOINT_NAMES[:5]
 CONTROL_HZ = 20
 PHYSICS_HZ = 500
-CLOCK_OBSERVATION_START = 25
+OBSERVATION_SIZE = 25
 
 
 class BallCupTrainingEnv(gym.Env):
@@ -192,14 +192,13 @@ class BallCupTrainingEnv(gym.Env):
             low=-1.0, high=1.0, shape=(6,), dtype=np.float32
         )
         # 6 measured joint positions + 6 velocities + EE/ball/cup positions (9)
-        # + ball linear velocity (3) + time fraction (1) + a finite-horizon
-        # one-hot clock. Actual gripper state supports feedback for relative
-        # gripper actions; the clock makes demo phases identifiable.
+        # + ball linear velocity (3) + elapsed episode fraction (1).
+        # The physical state is sufficient for feedback; no scripted clock is used.
         float32_limit = np.finfo(np.float32).max
         self.observation_space = spaces.Box(
             low=-float32_limit,
             high=float32_limit,
-            shape=(CLOCK_OBSERVATION_START + self.horizon,),
+            shape=(OBSERVATION_SIZE,),
             dtype=np.float32,
         )
         self.steps = 0
@@ -565,10 +564,9 @@ class BallCupTrainingEnv(gym.Env):
                 cup,
                 ball_velocity,
                 [self.steps / self.horizon],
-                np.eye(1, self.horizon, min(self.steps, self.horizon - 1))[0],
             ]
         ).astype(np.float32)
-        if observation.shape != (CLOCK_OBSERVATION_START + self.horizon,):
+        if observation.shape != (OBSERVATION_SIZE,):
             raise RuntimeError(f"Internal observation has shape {observation.shape}")
         return observation
 

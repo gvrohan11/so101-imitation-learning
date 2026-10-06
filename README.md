@@ -40,11 +40,10 @@ finger collision meshes. Run the environment checks before training:
   0.1 rad per 20 Hz action, relative to its measured joint position, and clips
   to the safe pinch target (`0.26` rad) and open target. Existing position
   servos and force limits remain in use.
-- The observation has 25 physical values—six measured joint positions, six
-  measured velocities, gripper XYZ, ball XYZ, cup XYZ, ball linear velocity,
-  and time fraction—followed by a 500-value one-hot policy clock. The default
-  observation shape is 525. PPO receives normalized state and clock, not camera
-  pixels.
+- The observation contains 25 physical values: six measured joint positions,
+  six measured velocities, gripper XYZ, ball XYZ, cup XYZ, ball linear velocity,
+  and elapsed episode fraction. PPO receives normalized simulator state, not
+  camera pixels or a scripted one-hot clock.
 - Approach shaping follows the demonstrated path: a waypoint 60 mm above the
   grasp site, then the grasp site's offset `(0.020, -0.008, -0.010)` m from
   the ball center with wrist flex `0.5` rad and wrist roll `-2.7` rad. A reach
@@ -66,57 +65,48 @@ finger collision meshes. Run the environment checks before training:
   cup opening with 3 mm clearance, sit between the floor and rim, leave all
   gripper contact, and remain settled for 0.25 seconds.
 
-The reward is a sum of signed approach progress (`4` per meter), one-time
-stable-grasp `+2`, one-time lift `+2`, new-best held transport progress (`8` per
-meter), one-time above-cup `+3`, one-time correct release `+5`, and terminal
+The reward is a sum of signed approach progress (`40` per meter), one-time
+stable-grasp `+2`, one-time lift `+2`, new-best held transport progress (`40`
+per meter), one-time above-cup `+3`, one-time correct release `+5`, and terminal
 success `+50`. It subtracts one-time outside-drop `5`, unsafe collision `0.25`,
 joint-limit clipping at `0.1` times the clipped target delta divided by the
-2-degree action limit, `0.01` per action step,
-and unrecoverable failure `10`. Progress is signed or best-so-far; event bonuses
-are one-time, so hovering, oscillating, or repeating grasps cannot farm reward.
-All weights and thresholds are in `config/ppo_training.json`.
+2-degree action limit, `0.01` per action step, and unrecoverable failure `10`.
+Progress is signed or best-so-far; event bonuses are one-time, so hovering,
+oscillating, or repeating grasps cannot farm reward. All weights and thresholds
+are in `config/ppo_training.json`.
 
-PPO uses Stable-Baselines3 with a 512-unit tanh actor layer and a `[512, 512]`
-value network, learning rate `1e-5`, rollout length `2048`, minibatch `256`,
-5 epochs, target KL `0.01`, gamma `0.99`, GAE lambda `0.95`, clip `0.2`,
-value coefficient `0.5`, and gradient norm `0.5`. Action standard deviation
-starts at `0.05` and stays fixed. Observation normalization is enabled; reward
-normalization is off so logged returns retain the configured reward scale.
+PPO uses Stable-Baselines3 with randomly initialized `[512, 512]` tanh actor and
+critic networks. It starts from Stage 1 with no scripted demonstration, clock
+lookup initialization, or action anchoring. The initial action standard
+deviation is `0.25` and trainable; observation normalization is enabled and
+reward normalization is off. Dense approach and transport progress rewards
+guide learning before the terminal placement reward.
 
-Before PPO starts, the code generates a successful retimed expert episode at
-20 Hz, checks every arm action against the 2-degree bound, and initializes the
-actor's clock units from that action sequence. The deterministic Stage 1
-warm-start must reach at least 90% success over 50 episodes or training stops.
-On a normal run, that verified demonstration marks fixed-scene Stage 1 as
-solved, so PPO starts with the randomized Stage 2 instead of unlearning the
-successful trajectory on Stage 1. After each PPO update, a ridge projection
-adjusts the actor's final action layer to match the expert actions on the
-demonstration states, with the smallest parameter change possible. It preserves
-the hidden state-feedback features PPO learns for randomized scenes. If any
-stage records no stable grasps across three consecutive evaluation windows,
-training stops early instead of spending the full million-step budget.
-Run this validation first; it saves the demonstration, policy, normalization
-statistics, and warm-start report without launching PPO:
+Every stage must reach 90% success over 50 evaluation episodes at three
+consecutive evaluation windows before the curriculum advances. Stage 1 is
+trained from scratch on the fixed scene. Stage 2 randomizes the ball, Stage 3
+also randomizes the cup, Stage 4 adds start-joint jitter, and Stage 5 adds cup
+size variation. Stage 1 is allowed its full budget even if early evaluations
+have no grasps. Later stages retain the zero-grasp early-stop safeguard.
+
+Run a short PPO train/evaluate/checkpoint-reload smoke test, then launch the
+full five-stage curriculum:
 
 ```bash
-.venv/bin/python -m experiments.train_ppo --initialize-only
+.venv/bin/python -m experiments.train_ppo --smoke-test
 ```
-
-The short smoke test runs 128 PPO steps and two deterministic evaluation
-episodes. It does not launch the curriculum. After the initialization-only run
-passes, start the full five-stage curriculum with:
 
 ```bash
 .venv/bin/python -m experiments.train_ppo
 ```
 
-Checkpoints, Monitor episode CSV files, PPO's `progress.csv`, and deterministic
-evaluation results are written under `outputs/ball_cup_ppo_anchored/`, separate
-from the failed run's existing logs. Curriculum
-advancement requires at least 100,000 training steps in a stage, then a 90%
-success rate over 50 deterministic episodes at three consecutive evaluations
-25,000 steps apart. A stage stops after 1,000,000 training steps if it has not
-passed. Training reward does not advance the curriculum.
+The smoke test runs 128 PPO steps and two deterministic evaluation episodes; it
+does not launch the curriculum. The full command starts a new, timestamped run
+under `outputs/ball_cup_ppo_from_scratch/`, so evaluations cannot be mixed with
+older runs. Checkpoints, Monitor episode CSV files, PPO's `progress.csv`, and
+deterministic evaluation results are saved there. Each stage is capped at
+1,000,000 steps, with evaluations every 25,000 steps after the first 100,000.
+Training reward does not advance the curriculum.
 
 The randomization boxes are a conservative ±10 mm neighborhood of one
 verified scripted pick-and-place scene, not a complete IK-certified reachable
