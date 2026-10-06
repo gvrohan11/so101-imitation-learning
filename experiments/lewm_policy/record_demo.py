@@ -23,8 +23,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 class CameraRecordingExpert(_RetimedExpert):
-    def __init__(self, env, candidate):
-        super().__init__(env, candidate)
+    def __init__(self, env, candidate, *, execution_action_noise_std=0.0):
+        super().__init__(
+            env,
+            candidate,
+            execution_action_noise_std=execution_action_noise_std,
+        )
         self.images: list[np.ndarray] = []
         self.proprio: list[np.ndarray] = []
 
@@ -38,7 +42,18 @@ class CameraRecordingExpert(_RetimedExpert):
         return super()._step(target_q, gripper_target)
 
 
-def record_demo(config_path: str | Path, output_path: str | Path, seed: int | None = None):
+def record_demo(
+    config_path: str | Path,
+    output_path: str | Path,
+    seed: int | None = None,
+    *,
+    episodes: int = 8,
+    execution_action_noise_std: float = 0.1,
+):
+    if episodes <= 0:
+        raise ValueError("episodes must be positive")
+    if execution_action_noise_std < 0.0:
+        raise ValueError("execution_action_noise_std must be non-negative")
     config = load_training_config(config_path)
     effective_seed = int(config["seed"] if seed is None else seed)
     with contextlib.redirect_stdout(io.StringIO()):
@@ -50,25 +65,58 @@ def record_demo(config_path: str | Path, output_path: str | Path, seed: int | No
     expected_offset = np.asarray(config["task"]["grasp_site_offset_m"])
     if not np.allclose(candidate[3], expected_offset, atol=1e-9):
         raise RuntimeError("Demonstration grasp pose differs from the training configuration")
-    env = BallCupTrainingEnv(
-        stage=1,
-        seed=effective_seed,
-        config_path=config_path,
-        render_mode="rgb_array",
-    )
-    env._renderer = mujoco.Renderer(env.model, height=IMAGE_SIZE, width=IMAGE_SIZE)
-    try:
-        expert = CameraRecordingExpert(env, candidate)
-        observations, actions, metadata = expert.run(effective_seed)
-        images = np.asarray(expert.images, dtype=np.uint8)
-        proprio = np.asarray(expert.proprio, dtype=np.float32)
-    finally:
-        env.close()
+    episode_images = []
+    episode_proprio = []
+    episode_actions = []
+    episode_metadata = []
+    for episode_index in range(int(episodes)):
+        episode_seed = effective_seed + episode_index
+        env = BallCupTrainingEnv(
+            stage=1,
+            seed=episode_seed,
+            config_path=config_path,
+            render_mode="rgb_array",
+        )
+        env._renderer = mujoco.Renderer(env.model, height=IMAGE_SIZE, width=IMAGE_SIZE)
+        try:
+            expert = CameraRecordingExpert(
+                env,
+                candidate,
+                execution_action_noise_std=execution_action_noise_std,
+            )
+            observations, actions, metadata = expert.run(episode_seed)
+            images = np.asarray(expert.images, dtype=np.uint8)
+            proprio = np.asarray(expert.proprio, dtype=np.float32)
+        finally:
+            env.close()
 
-    if not (len(images) == len(proprio) == len(actions) == len(observations)):
-        raise RuntimeError("Recorded camera/state/action samples are not aligned")
-    if not metadata.get("success") or not metadata["phase_success"].get("placement"):
-        raise RuntimeError("Refusing to save an unsuccessful pick-and-place demonstration")
+        if not (len(images) == len(proprio) == len(actions) == len(observations)):
+            raise RuntimeError(
+                f"Demonstration {episode_index + 1} camera/state/action samples are not aligned"
+            )
+        if not metadata.get("success") or not metadata["phase_success"].get("placement"):
+            raise RuntimeError(
+                f"Refusing to save unsuccessful demonstration {episode_index + 1}"
+            )
+        episode_images.append(images)
+        episode_proprio.append(proprio)
+        episode_actions.append(np.asarray(actions, dtype=np.float32))
+        episode_metadata.append(metadata)
+
+    images = np.concatenate(episode_images, axis=0)
+    proprio = np.concatenate(episode_proprio, axis=0)
+    actions = np.concatenate(episode_actions, axis=0)
+    metadata = {
+        "success": True,
+        "episode_count": len(episode_metadata),
+        "steps": int(len(actions)),
+        "execution_action_noise_std": float(execution_action_noise_std),
+        "episodes": episode_metadata,
+        "phase_success": {
+            phase: all(row["phase_success"][phase] for row in episode_metadata)
+            for phase in episode_metadata[0]["phase_success"]
+        },
+    }
 
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -100,12 +148,19 @@ def main(argv=None):
         default=PROJECT_ROOT / "outputs" / "lewm_policy" / "expert_demo.npz",
     )
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--episodes", type=int, default=8)
+    parser.add_argument("--execution-action-noise-std", type=float, default=0.1)
     args = parser.parse_args(argv)
-    output, metadata = record_demo(args.config, args.output, args.seed)
+    output, metadata = record_demo(
+        args.config,
+        args.output,
+        args.seed,
+        episodes=args.episodes,
+        execution_action_noise_std=args.execution_action_noise_std,
+    )
     print(json.dumps({"demo_path": str(output), **metadata}, indent=2))
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

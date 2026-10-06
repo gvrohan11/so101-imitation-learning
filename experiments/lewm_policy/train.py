@@ -111,6 +111,7 @@ def evaluate(model: PPO, *, stage: int, episodes: int, seed: int) -> dict:
                     "seed": seed + episode,
                     "return": total_reward,
                     "length": length,
+                    "failure_reason": str(info.get("failure_reason", "")),
                     **{
                         name: bool(metrics.get(name, info.get(name, False)))
                         for name in (
@@ -206,6 +207,13 @@ def main(argv=None):
     )
     parser.add_argument("--checkpoint", type=Path, default=None)
     parser.add_argument("--demo", type=Path, default=None)
+    parser.add_argument(
+        "--refresh-demo",
+        action="store_true",
+        help="Overwrite --demo with multiple corrected, mildly perturbed expert episodes.",
+    )
+    parser.add_argument("--demo-episodes", type=int, default=8)
+    parser.add_argument("--demo-action-noise-std", type=float, default=0.1)
     parser.add_argument("--stage", type=int, choices=range(1, 6), default=1)
     parser.add_argument("--timesteps", type=int, default=250_000)
     parser.add_argument("--eval-freq", type=int, default=25_000)
@@ -227,9 +235,18 @@ def main(argv=None):
         else None
     )
     demo_path = args.demo or PROJECT_ROOT / "outputs" / "lewm_policy" / "expert_demo.npz"
-    if not demo_path.is_file():
-        print(f"Recording successful scripted demonstration to {demo_path}")
-        record_demo(args.config, demo_path, seed=int(config["seed"]))
+    if args.refresh_demo or not demo_path.is_file():
+        print(
+            f"Recording {args.demo_episodes} corrected expert episodes to {demo_path} "
+            f"(arm action noise std={args.demo_action_noise_std})"
+        )
+        record_demo(
+            args.config,
+            demo_path,
+            seed=int(config["seed"]),
+            episodes=args.demo_episodes,
+            execution_action_noise_std=args.demo_action_noise_std,
+        )
 
     with np.load(demo_path, allow_pickle=False) as demo:
         camera_images = demo["camera_images"].copy()
@@ -329,7 +346,9 @@ def main(argv=None):
     )
     print(
         f"BC action MSE={bc_mse:.6g}; fixed-scene warm start "
-        f"{warm_start['successes']}/{warm_start['episodes']}"
+        f"{warm_start['successes']}/{warm_start['episodes']}; "
+        f"phase rates={warm_start['phase_rates']}; "
+        f"failure reasons={[row['failure_reason'] for row in warm_start['episode_rows']]}"
     )
     required_warm_start_rate = float(ppo["minimum_warm_start_success_rate"])
     if warm_start["success_rate"] < required_warm_start_rate:
@@ -337,8 +356,9 @@ def main(argv=None):
         raise RuntimeError(
             "The behavior-cloned LeWM policy did not replay the verified fixed-scene "
             f"task ({warm_start['success_rate']:.0%} < {required_warm_start_rate:.0%}). "
-            "PPO was not started. Increase --bc-epochs or provide more successful "
-            "camera/state/action demonstrations, then rerun."
+            "PPO was not started. The current demonstration set does not cover enough "
+            "states produced by small action errors. Regenerate a multi-episode "
+            "corrected demonstration with --refresh-demo before retrying."
         )
 
     callback = VisionEvaluationCallback(

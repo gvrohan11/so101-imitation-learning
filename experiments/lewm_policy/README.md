@@ -47,11 +47,12 @@ camera frame in this repository:
 Recording a fresh scripted demo and running PPO require a working MuJoCo renderer;
 on a headless Linux machine set `MUJOCO_GL=egl` as above.
 
-Record a successful scripted episode with aligned RGB frames, robot state, and actions, then initialize PPO's actor from that example and train the LeWM policy:
+Record eight successful scripted episodes with aligned RGB frames, robot state, and actions. The teacher lightly perturbs executed arm commands and replans from the resulting state, while saving its clean corrective commands as labels. This covers small trajectory deviations that a single clean demonstration cannot teach. Then initialize PPO's actor from these examples and train the LeWM policy:
 
 ```bash
 .venv/bin/python -m experiments.lewm_policy.record_demo \
-  --output outputs/lewm_policy/expert_demo.npz
+  --output outputs/lewm_policy/expert_demo.npz \
+  --episodes 8 --execution-action-noise-std 0.1
 
 .venv/bin/python -m experiments.lewm_policy.train \
   --visual-backbone lewm --checkpoint "$CHECKPOINT" \
@@ -61,7 +62,7 @@ Record a successful scripted episode with aligned RGB frames, robot state, and a
 
 Stage 1 reproduces the fixed scene used by the successful scripted demonstration. Once that works, use `--stage 2` to randomize the ball position while keeping the cup fixed. Higher stages randomize more of the setup. The evaluation callback saves per-episode phase rates and best/latest model checkpoints under `outputs/lewm_policy/lewm/stage_XX/`.
 
-The training command does not require TensorBoard. Before PPO starts, it behavior-clones the state/fusion/actor layers from the recorded actions and replays the policy on the fixed scene. PPO is deliberately stopped unless that warm-start replay reaches the configured minimum success rate (90% by default). If it stops at this gate, inspect `initialization.json`; collect more successful demonstrations or improve the behavior-cloning fit before spending time on PPO.
+The training command does not require TensorBoard. Before PPO starts, it behavior-clones the state/fusion/actor layers from the recorded actions and replays the policy on the fixed scene. PPO is deliberately stopped unless that warm-start replay reaches the configured minimum success rate (90% by default). Add `--refresh-demo` to overwrite an existing demo with the multi-episode corrected set. If the gate still stops, the run prints phase rates and per-episode failure reasons, and saves them to `initialization.json`.
 
 Run the ResNet comparison with the same demonstration and stage:
 

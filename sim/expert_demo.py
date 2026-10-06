@@ -39,13 +39,16 @@ def _rotation_vector(target_rotation, current_rotation):
 class _RetimedExpert:
     """Waypoint IK teacher whose every action passes through the PPO wrapper."""
 
-    def __init__(self, env: BallCupTrainingEnv, candidate):
+    def __init__(self, env: BallCupTrainingEnv, candidate, *, execution_action_noise_std=0.0):
         self.env = env
         self.model, self.data = env.model, env.data
         self.candidate = candidate
         self.observations: list[np.ndarray] = []
         self.actions: list[np.ndarray] = []
         self.max_requested_arm_delta = 0.0
+        self.execution_action_noise_std = float(execution_action_noise_std)
+        if self.execution_action_noise_std < 0.0:
+            raise ValueError("execution_action_noise_std must be non-negative")
         self.qpos_ids = env.joint_qpos.copy()
         self.dof_ids = env.joint_qvel.copy()
         self.site_id = env.sim.gripper_site
@@ -87,7 +90,19 @@ class _RetimedExpert:
             raise RuntimeError("Expert exceeded the policy's per-step arm limit")
         self.arm_hold_target = targets.copy()
 
-        observation, _, terminated, truncated, info = self.env.step(action)
+        # Keep the clean expert command as the learning label, but optionally
+        # perturb the executed arm command. The expert replans from the resulting
+        # state on the next control tick, which supplies corrective labels over
+        # states a perfectly replayed single trajectory would never visit.
+        executed_action = action.copy()
+        if self.execution_action_noise_std:
+            executed_action[:5] = np.clip(
+                executed_action[:5]
+                + self.env.rng.normal(0.0, self.execution_action_noise_std, size=5),
+                -1.0,
+                1.0,
+            )
+        observation, _, terminated, truncated, info = self.env.step(executed_action)
         self.observations.append(before)
         self.actions.append(action.copy())
         if terminated or truncated:
@@ -511,7 +526,9 @@ class _RetimedExpert:
         }
 
 
-def generate_demonstration(config_path=None, *, seed=None):
+def generate_demonstration(
+    config_path=None, *, seed=None, execution_action_noise_std=0.0
+):
     config = load_training_config(config_path)
     ball_radius = 0.020
     with contextlib.redirect_stdout(io.StringIO()):
@@ -536,13 +553,18 @@ def generate_demonstration(config_path=None, *, seed=None):
         config_path=config_path,
     )
     try:
-        teacher = _RetimedExpert(env, candidate)
+        teacher = _RetimedExpert(
+            env,
+            candidate,
+            execution_action_noise_std=execution_action_noise_std,
+        )
         observations, actions, metadata = teacher.run(
             int(config["seed"] if seed is None else seed)
         )
     finally:
         env.close()
     metadata["ball_radius_m"] = ball_radius
+    metadata["execution_action_noise_std"] = float(execution_action_noise_std)
     return observations, actions, metadata
 
 
@@ -566,8 +588,12 @@ def main(argv=None):
         type=Path,
         default=PROJECT_ROOT / "outputs" / "ball_cup_ppo" / "demonstration_stage01.npz",
     )
+    parser.add_argument("--execution-action-noise-std", type=float, default=0.0)
     args = parser.parse_args(argv)
-    observations, actions, metadata = generate_demonstration(args.config)
+    observations, actions, metadata = generate_demonstration(
+        args.config,
+        execution_action_noise_std=args.execution_action_noise_std,
+    )
     output = save_demonstration(args.output, observations, actions, metadata)
     print(json.dumps({"demonstration": str(output), **metadata}, indent=2))
     return 0
