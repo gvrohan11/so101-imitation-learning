@@ -61,6 +61,8 @@ Record a successful scripted episode with aligned RGB frames, robot state, and a
 
 Stage 1 reproduces the fixed scene used by the successful scripted demonstration. Once that works, use `--stage 2` to randomize the ball position while keeping the cup fixed. Higher stages randomize more of the setup. The evaluation callback saves per-episode phase rates and best/latest model checkpoints under `outputs/lewm_policy/lewm/stage_XX/`.
 
+The training command does not require TensorBoard. Before PPO starts, it behavior-clones the state/fusion/actor layers from the recorded actions and replays the policy on the fixed scene. PPO is deliberately stopped unless that warm-start replay reaches the configured minimum success rate (90% by default). If it stops at this gate, inspect `initialization.json`; collect more successful demonstrations or improve the behavior-cloning fit before spending time on PPO.
+
 Run the ResNet comparison with the same demonstration and stage:
 
 ```bash

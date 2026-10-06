@@ -25,16 +25,18 @@ from .record_demo import record_demo
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 def _demonstration_features(model: PPO, camera_images, robot_state, batch_size=32):
     device = model.device
-    images = torch.as_tensor(camera_images, device=device).permute(0, 3, 1, 2)
+    images = (
+        torch.as_tensor(camera_images, device=device)
+        .permute(0, 3, 1, 2)
+        .float()
+        .div_(255.0)
+    )
     states = torch.as_tensor(robot_state, dtype=torch.float32, device=device)
     features = []
+    visual = model.policy.features_extractor.visual
     with torch.no_grad():
         for start in range(0, len(images), batch_size):
-            observation = {
-                "image": images[start : start + batch_size],
-                "proprio": states[start : start + batch_size],
-            }
-            features.append(model.policy.extract_features(observation).detach())
+            features.append(visual(images[start : start + batch_size]).detach())
     return torch.cat(features), states
 
 
@@ -44,31 +46,46 @@ def behavior_clone_actor(
     robot_state: np.ndarray,
     actions: np.ndarray,
     *,
-    epochs: int = 60,
+    epochs: int = 200,
     batch_size: int = 64,
     learning_rate: float = 1e-3,
 ) -> float:
-    """Initialize the PPO actor from successful demonstrations, with frozen vision."""
-    features, _ = _demonstration_features(model, camera_images, robot_state)
+    """Initialize the PPO actor from demonstrations while keeping vision frozen."""
+    visual_features, states = _demonstration_features(
+        model, camera_images, robot_state
+    )
     action_tensor = torch.as_tensor(actions, dtype=torch.float32, device=model.device)
     policy = model.policy
-    trainable = list(policy.mlp_extractor.policy_net.parameters()) + list(
-        policy.action_net.parameters()
+    extractor = policy.features_extractor
+    trainable = (
+        list(extractor.state_net.parameters())
+        + list(extractor.fusion.parameters())
+        + list(policy.mlp_extractor.policy_net.parameters())
+        + list(policy.action_net.parameters())
     )
     optimizer = torch.optim.Adam(trainable, lr=learning_rate)
-    final_mse = float("nan")
     for _ in range(int(epochs)):
         order = torch.randperm(len(action_tensor), device=model.device)
         for start in range(0, len(order), batch_size):
             indices = order[start : start + batch_size]
-            latent_pi, _ = policy.mlp_extractor(features[indices])
+            state_features = extractor.state_net(states[indices])
+            fused = extractor.fusion(
+                torch.cat((visual_features[indices], state_features), dim=1)
+            )
+            latent_pi, _ = policy.mlp_extractor(fused)
             mean_actions = policy.action_net(latent_pi)
             loss = F.mse_loss(mean_actions, action_tensor[indices])
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
-            final_mse = float(loss.detach().cpu())
-    return final_mse
+
+    with torch.no_grad():
+        state_features = extractor.state_net(states)
+        fused = extractor.fusion(torch.cat((visual_features, state_features), dim=1))
+        latent_pi, _ = policy.mlp_extractor(fused)
+        mean_actions = policy.action_net(latent_pi)
+        full_dataset_mse = F.mse_loss(mean_actions, action_tensor)
+    return float(full_dataset_mse.cpu())
 
 
 def evaluate(model: PPO, *, stage: int, episodes: int, seed: int) -> dict:
@@ -193,7 +210,7 @@ def main(argv=None):
     parser.add_argument("--timesteps", type=int, default=250_000)
     parser.add_argument("--eval-freq", type=int, default=25_000)
     parser.add_argument("--eval-episodes", type=int, default=10)
-    parser.add_argument("--bc-epochs", type=int, default=60)
+    parser.add_argument("--bc-epochs", type=int, default=200)
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--random-resnet", action="store_true")
@@ -268,26 +285,29 @@ def main(argv=None):
             seed=int(config["seed"]),
             device=args.device,
             verbose=1,
-            tensorboard_log=str(output_dir / "tensorboard"),
         )
     except Exception:
         vector_env.close()
         raise
 
-    bc_mse = behavior_clone_actor(
-        model,
-        camera_images,
-        robot_state,
-        demo_actions,
-        epochs=args.bc_epochs,
-    )
-    model.save(str(output_dir / "behavior_cloned_model"))
-    warm_start = evaluate(
-        model,
-        stage=1,
-        episodes=max(5, min(10, args.eval_episodes)),
-        seed=5000,
-    )
+    try:
+        bc_mse = behavior_clone_actor(
+            model,
+            camera_images,
+            robot_state,
+            demo_actions,
+            epochs=args.bc_epochs,
+        )
+        model.save(str(output_dir / "behavior_cloned_model"))
+        warm_start = evaluate(
+            model,
+            stage=1,
+            episodes=max(5, min(10, args.eval_episodes)),
+            seed=5000,
+        )
+    except Exception:
+        vector_env.close()
+        raise
     (output_dir / "initialization.json").write_text(
         json.dumps(
             {
@@ -311,6 +331,15 @@ def main(argv=None):
         f"BC action MSE={bc_mse:.6g}; fixed-scene warm start "
         f"{warm_start['successes']}/{warm_start['episodes']}"
     )
+    required_warm_start_rate = float(ppo["minimum_warm_start_success_rate"])
+    if warm_start["success_rate"] < required_warm_start_rate:
+        vector_env.close()
+        raise RuntimeError(
+            "The behavior-cloned LeWM policy did not replay the verified fixed-scene "
+            f"task ({warm_start['success_rate']:.0%} < {required_warm_start_rate:.0%}). "
+            "PPO was not started. Increase --bc-epochs or provide more successful "
+            "camera/state/action demonstrations, then rerun."
+        )
 
     callback = VisionEvaluationCallback(
         output_dir,
@@ -326,9 +355,11 @@ def main(argv=None):
             reset_num_timesteps=False,
             progress_bar=False,
         )
-    finally:
-        model.save(str(output_dir / "final_model"))
+    except Exception:
         vector_env.close()
+        raise
+    model.save(str(output_dir / "final_model"))
+    vector_env.close()
     summary = {
         "visual_backbone": args.visual_backbone,
         "stage": args.stage,
