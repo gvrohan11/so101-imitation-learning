@@ -1,0 +1,5 @@
+#{"t_start": 1791305580.674949, "env_id": "None"}
+r,l,t,is_success,curriculum_stage,reach_success,grasp_success,lift_success,transport_success,above_cup_success,correct_release,placement_success
+-2.205709,500,2.381562,False,1,False,False,False,False,False,False,False
+-3.989908,500,3.449341,False,1,False,False,False,False,False,False,False
+-6.923598,500,4.524632,False,1,False,False,False,False,False,False,False

@@ -1,0 +1,17 @@
+{
+  "stages": [
+    {
+      "stage": 1,
+      "outcome": "failed_maximum_budget",
+      "steps": 1000000,
+      "consecutive_passing_evaluations": 0,
+      "best_evaluation_success_rate": 0.0
+    }
+  ],
+  "global_best": {
+    "success_rate": 0.0,
+    "stage": 1,
+    "global_env_steps": 100000
+  },
+  "final_global_steps": 1000000
+}

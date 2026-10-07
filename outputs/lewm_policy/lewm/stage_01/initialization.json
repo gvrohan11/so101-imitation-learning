@@ -1,0 +1,21 @@
+{
+  "visual_backbone": "lewm",
+  "lewm_checkpoint": "/workspace/checkpoints/lewm_seq_projectors.pt",
+  "demo_path": "/workspace/so101-imitation-learning/outputs/lewm_policy/expert_demo.npz",
+  "demonstration_steps": 343,
+  "behavior_cloning_action_mse": 0.03967976197600365,
+  "fixed_scene_warm_start": {
+    "successes": 0,
+    "episodes": 10,
+    "success_rate": 0.0,
+    "phase_rates": {
+      "reach_success": 0.0,
+      "grasp_success": 0.0,
+      "lift_success": 0.0,
+      "transport_success": 0.0,
+      "above_cup_success": 0.0,
+      "correct_release": 0.0,
+      "placement_success": 0.0
+    }
+  }
+}

@@ -1,4 +1,3 @@
-outputs/
 wandb/
 .venv/
 __pycache__/
