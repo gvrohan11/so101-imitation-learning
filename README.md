@@ -60,15 +60,19 @@ finger collision meshes. Run the environment checks before training:
   the actual-gripper transfer reliably, so training does not sample those sizes.
   The narrow XY boxes are centered on the prior successful scripted scene:
   ball `(0.1857, -0.1980)` m and cup `(0.2555, 0.1208)` m.
-- Placement must follow a stable bilateral grasp and a lift above `z = 0.035`
-  m. Success also requires the full ball sphere to fit inside the octagonal
-  cup opening with 3 mm clearance, sit between the floor and rim, leave all
-  gripper contact, and remain settled for 0.25 seconds.
+- Placement must follow a stable bilateral grasp, carry the ball above the cup
+  rim while pinched, deliberately open the gripper over the cup, and let the
+  ball settle. Success also requires the full ball sphere to fit inside the
+  octagonal cup opening with 3 mm clearance, sit between the floor and rim,
+  leave all gripper contact, and remain settled for 0.25 seconds. A ball that
+  falls or is knocked into the cup without a verified above-rim carry and
+  release does not count as a successful placement.
 
 The reward is a sum of signed approach progress (`40` per meter), one-time
 grasp-pose reach `+3`, stable-grasp `+2`, signed ball-lift progress (`80` per
-meter, capped at the lift threshold), one-time lift `+2`, new-best held
-transport progress (`40` per meter), one-time above-cup `+3`, one-time correct
+meter, capped at the lift threshold), one-time lift `+2`, new-best held carry
+height progress (`80` per meter up to 20 mm above the cup rim), new-best held
+transport progress (`40` per meter), one-time above-cup `+3`, one-time verified
 release `+5`, and terminal success `+50`. It subtracts one-time outside-drop `5`, unsafe collision `0.25`,
 joint-limit clipping at `0.1` times the clipped target delta divided by the
 2-degree action limit, `0.01` per action step, and unrecoverable failure `10`.
@@ -82,6 +86,8 @@ rewards; the hardcoded expert is not used to initialize, update, evaluate, or
 pass the policy. PPO starts with a trainable action standard deviation of
 `0.25`, uses `gamma = 0.995` and `GAE lambda = 0.98` to carry credit farther
 across the pick-and-place horizon, and keeps entropy regularization enabled.
+State-dependent exploration holds coherent action noise for four control
+steps, giving the arm time to move in a direction before resampling.
 Observation normalization is enabled and reward normalization is off.
 Dense approach, grasp-pose, lift, and transport rewards guide PPO before the
 terminal placement reward.

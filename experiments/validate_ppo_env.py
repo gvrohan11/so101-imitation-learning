@@ -115,9 +115,14 @@ def validate_success_detector_and_physical_cup(env):
     env.data.qvel[env.sim.ball_qvel:env.sim.ball_qvel + 6] = 0.0
     mujoco.mj_forward(env.model, env.data)
     assert env._ball_inside_cup_volume(safety_margin=0.0)
+    # A ball simply placed in the cup after a prior grasp is not enough; a
+    # verified carry above the rim and deliberate open command are required.
+    assert not env._is_settled_placement()
     env.holding_ball = True
     assert not env._is_settled_placement()
     env.holding_ball = False
+    env.above_cup_success = True
+    env.released_over_cup = True
     for step in range(6):
         _, _, terminated, truncated, info = env.step(np.array([0, 0, 0, 0, 0, 1]))
         if terminated:
@@ -140,6 +145,8 @@ def validate_success_detector_and_physical_cup(env):
             mujoco.mj_forward(env.model, env.data)
         env.grasp_success = True
         env.lift_success = True
+        env.above_cup_success = True
+        env.released_over_cup = True
         cup = env.data.xpos[env.sim.cup_body].copy()
         _, _, rim_top = env._cup_dimensions()
         env.data.qpos[env.sim.ball_qpos:env.sim.ball_qpos + 3] = [

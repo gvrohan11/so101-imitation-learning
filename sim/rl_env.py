@@ -16,7 +16,7 @@ from sim.training_config import load_training_config
 ARM_JOINT_NAMES = JOINT_NAMES[:5]
 CONTROL_HZ = 20
 PHYSICS_HZ = 500
-OBSERVATION_SIZE = 25
+OBSERVATION_SIZE = 37
 
 
 class BallCupTrainingEnv(gym.Env):
@@ -191,9 +191,9 @@ class BallCupTrainingEnv(gym.Env):
         self.action_space = spaces.Box(
             low=-1.0, high=1.0, shape=(6,), dtype=np.float32
         )
-        # 6 measured joint positions + 6 velocities + EE/ball/cup positions (9)
-        # + ball linear velocity (3) + elapsed episode fraction (1).
-        # The physical state is sufficient for feedback; no scripted clock is used.
+        # 6 joint positions + 6 velocities + EE/ball/cup positions (9), ball
+        # velocity (3), EE-to-ball and ball-to-cup vectors (6), six grasp/task
+        # flags, and elapsed episode fraction (1).
         float32_limit = np.finfo(np.float32).max
         self.observation_space = spaces.Box(
             low=-float32_limit,
@@ -373,6 +373,7 @@ class BallCupTrainingEnv(gym.Env):
         self.lift_success = False
         self.transport_success = False
         self.above_cup_success = False
+        self.released_over_cup = False
         self.correct_release = False
         self.placement_success = False
         self.dropped_outside_cup = False
@@ -384,6 +385,7 @@ class BallCupTrainingEnv(gym.Env):
             name: 0.0
             for name in (
                 "reach_progress", "reach_pose", "grasp", "lift_progress",
+                "carry_height_progress",
                 "lift",
                 "transport_progress",
                 "above_cup", "correct_release", "success",
@@ -392,6 +394,7 @@ class BallCupTrainingEnv(gym.Env):
             )
         }
         self._previous_lift_progress = 0.0
+        self._best_carry_height_progress = 0.0
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
@@ -552,6 +555,9 @@ class BallCupTrainingEnv(gym.Env):
         if (
             not self.grasp_success
             or not self.lift_success
+            or not self.above_cup_success
+            or not self.released_over_cup
+            or not self.correct_release
             or self.holding_ball
             or not self._ball_inside_cup_volume()
         ):
@@ -578,6 +584,16 @@ class BallCupTrainingEnv(gym.Env):
                 ball,
                 cup,
                 ball_velocity,
+                ball - ee,
+                cup - ball,
+                [
+                    float(self.currently_pinched),
+                    float(self.holding_ball),
+                    float(self.grasp_success),
+                    float(self.lift_success),
+                    float(self.above_cup_success),
+                    float(self.released_over_cup),
+                ],
                 [self.steps / self.horizon],
             ]
         ).astype(np.float32)
@@ -622,6 +638,7 @@ class BallCupTrainingEnv(gym.Env):
             "lift_success": bool(self.lift_success),
             "transport_success": bool(self.transport_success),
             "above_cup_success": bool(self.above_cup_success),
+            "released_over_cup": bool(self.released_over_cup),
             "correct_release": bool(self.correct_release),
             "placement_success": bool(self.placement_success),
             "currently_pinched": bool(self.currently_pinched),
@@ -642,6 +659,7 @@ class BallCupTrainingEnv(gym.Env):
         previously_grasped = self.grasp_success
         previously_lifted = self.lift_success
         previously_above_cup = self.above_cup_success
+        previously_holding_ball = self.holding_ball
         previously_correct_release = self.correct_release
         self.steps += 1
         invalid_state = False
@@ -698,8 +716,22 @@ class BallCupTrainingEnv(gym.Env):
                 and float(ball[2]) >= rim_top + self.ball_radius
             ):
                 self.above_cup_success = True
+
+            # Count a release only when the gripper deliberately opens after
+            # the ball has been carried above the rim. Merely knocking or
+            # throwing a previously grasped ball into the cup is not a pass.
+            release_open_threshold = self.gripper_policy_close_target + max(
+                2.0 * self.gripper_action_delta, 0.15
+            )
             if (
-                self.grasp_success
+                self.above_cup_success
+                and previously_holding_ball
+                and gripper_target >= release_open_threshold
+                and self._inside_cup_xy()
+            ):
+                self.released_over_cup = True
+            if (
+                self.released_over_cup
                 and not self.holding_ball
                 and self._ball_inside_cup_volume()
             ):
@@ -757,6 +789,28 @@ class BallCupTrainingEnv(gym.Env):
                     * (lift_progress - self._previous_lift_progress)
                 )
                 self._previous_lift_progress = lift_progress
+            if self.lift_success and self.currently_pinched:
+                _, _, rim_top = self._cup_dimensions()
+                carry_target_z = (
+                    rim_top
+                    + self.ball_radius
+                    + float(self.task["cup_rim_clearance_m"])
+                )
+                carry_height_progress = float(
+                    np.clip(
+                        float(self.data.xpos[self.sim.ball_body, 2])
+                        - float(self.task["lift_threshold_z_m"]),
+                        0.0,
+                        carry_target_z - float(self.task["lift_threshold_z_m"]),
+                    )
+                )
+                reward_terms["carry_height_progress"] = float(
+                    self.reward_config["carry_height_progress_per_meter"]
+                    * max(0.0, carry_height_progress - self._best_carry_height_progress)
+                )
+                self._best_carry_height_progress = max(
+                    self._best_carry_height_progress, carry_height_progress
+                )
             if self.lift_success and not previously_lifted:
                 reward_terms["lift"] = float(self.reward_config["lift_once"])
 
@@ -819,6 +873,7 @@ class BallCupTrainingEnv(gym.Env):
                 "lift_success": bool(self.lift_success),
                 "transport_success": bool(self.transport_success),
                 "above_cup_success": bool(self.above_cup_success),
+                "released_over_cup": bool(self.released_over_cup),
                 "correct_release": bool(self.correct_release),
                 "placement_success": bool(self.placement_success),
                 "episode_length": int(self.steps),

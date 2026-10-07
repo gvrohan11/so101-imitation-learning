@@ -134,10 +134,24 @@ class CurriculumStageCallback(BaseCallback):
                 save_bundle(self.model, self.output_dir, "best_model")
 
             if self.verbose:
+                phase_summary = ", ".join(
+                    f"{phase.replace('_success', '')}="
+                    f"{result['phase_rates'].get(phase, 0.0):.0%}"
+                    for phase in (
+                        "reach_success",
+                        "grasp_success",
+                        "lift_success",
+                        "transport_success",
+                        "above_cup_success",
+                        "released_over_cup",
+                        "correct_release",
+                    )
+                )
                 print(
                     f"Stage {self.stage} evaluation {self.evaluation_index}: "
                     f"{result['successes']}/{self.evaluation_episodes} "
                     f"successes ({success_rate:.1%}); "
+                    f"phases [{phase_summary}]; "
                     f"passing streak {self.consecutive_passes}/"
                     f"{self.required_consecutive}"
                 )

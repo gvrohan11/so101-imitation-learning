@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import argparse
 import copy
+import importlib.metadata
 import json
+import platform
+import subprocess
+import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,10 +25,51 @@ from experiments.ppo_common import (
     save_bundle,
 )
 from experiments.ppo_curriculum import CurriculumStageCallback
+from sim.rl_env import OBSERVATION_SIZE
 from sim.training_config import DEFAULT_CONFIG_PATH, load_training_config
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _runtime_metadata():
+    packages = {}
+    for distribution in (
+        "mujoco",
+        "stable-baselines3",
+        "gymnasium",
+        "numpy",
+        "torch",
+    ):
+        try:
+            packages[distribution] = importlib.metadata.version(distribution)
+        except importlib.metadata.PackageNotFoundError:
+            packages[distribution] = None
+    try:
+        git_revision = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=PROJECT_ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        git_dirty = bool(subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=no"],
+            cwd=PROJECT_ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip())
+    except (OSError, subprocess.CalledProcessError):
+        git_revision = None
+        git_dirty = None
+    return {
+        "python": sys.version.split()[0],
+        "platform": platform.platform(),
+        "packages": packages,
+        "git_revision": git_revision,
+        "git_dirty": git_dirty,
+    }
 
 
 def _make_policy_kwargs(config, *, smoke=False):
@@ -66,6 +111,10 @@ def run_smoke_test(config, config_path):
             ent_coef=float(ppo["entropy_coefficient"]),
             vf_coef=float(ppo["value_coefficient"]),
             max_grad_norm=float(ppo["max_gradient_norm"]),
+            use_sde=bool(ppo["use_state_dependent_exploration"]),
+            sde_sample_freq=int(
+                ppo["state_dependent_exploration_sample_freq"]
+            ),
             policy_kwargs=_make_policy_kwargs(ppo, smoke=True),
             seed=int(config["seed"]),
             verbose=0,
@@ -135,7 +184,7 @@ def run_training(config, config_path, output_dir):
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "seed": seed,
         "stage_order": [1, 2, 3, 4, 5],
-        "observation_size": 25,
+        "observation_size": OBSERVATION_SIZE,
         "policy_layers": list(ppo["policy_layers"]),
         "initial_action_std": float(ppo["initial_action_std"]),
         "learning_rate": float(ppo["learning_rate"]),
@@ -143,6 +192,7 @@ def run_training(config, config_path, output_dir):
         "pretrained_policy_used": False,
         "demonstration_action_anchor_used": False,
         "open_loop_clock_lookup_used": False,
+        "runtime": _runtime_metadata(),
         "config": config,
     }
     (output_dir / "run_metadata.json").write_text(
@@ -170,6 +220,10 @@ def run_training(config, config_path, output_dir):
         ent_coef=float(ppo["entropy_coefficient"]),
         vf_coef=float(ppo["value_coefficient"]),
         max_grad_norm=float(ppo["max_gradient_norm"]),
+        use_sde=bool(ppo["use_state_dependent_exploration"]),
+        sde_sample_freq=int(
+            ppo["state_dependent_exploration_sample_freq"]
+        ),
         policy_kwargs=_make_policy_kwargs(ppo),
         seed=seed,
         verbose=1,

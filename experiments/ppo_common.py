@@ -22,6 +22,7 @@ EPISODE_INFO_KEYS = (
     "lift_success",
     "transport_success",
     "above_cup_success",
+    "released_over_cup",
     "correct_release",
     "placement_success",
 )
@@ -138,6 +139,7 @@ def run_deterministic_evaluation(
                 "lift_success": bool(final_metrics.get("lift_success", info["lift_success"])),
                 "transport_success": bool(final_metrics.get("transport_success", info["transport_success"])),
                 "above_cup_success": bool(final_metrics.get("above_cup_success", info["above_cup_success"])),
+                "released_over_cup": bool(final_metrics.get("released_over_cup", info["released_over_cup"])),
                 "correct_release": bool(final_metrics.get("correct_release", info["correct_release"])),
                 "placement_success": bool(final_metrics.get("placement_success", info["placement_success"])),
                 "ball_radius_m": float(info["ball_radius_m"]),
@@ -159,7 +161,8 @@ def run_deterministic_evaluation(
             key: float(np.mean([row[key] for row in episode_rows]))
             for key in (
                 "reach_success", "grasp_success", "lift_success",
-                "transport_success", "above_cup_success", "correct_release",
+                "transport_success", "above_cup_success", "released_over_cup",
+                "correct_release",
                 "placement_success",
             )
         },
