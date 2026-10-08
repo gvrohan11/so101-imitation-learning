@@ -38,12 +38,13 @@ finger collision meshes. Run the environment checks before training:
   most 2 degrees relative to current measured joint positions. Targets clip to
   the model's joint limits. The sixth changes the gripper target by at most
   0.1 rad per 20 Hz action, relative to its measured joint position, and clips
-  to the safe pinch target (`0.26` rad) and open target. Existing position
+  to the validated pinch target (`0.28` rad) and open target. Existing position
   servos and force limits remain in use.
-- The observation contains 25 physical values: six measured joint positions,
+- The observation contains 37 physical values: six measured joint positions,
   six measured velocities, gripper XYZ, ball XYZ, cup XYZ, ball linear velocity,
-  and elapsed episode fraction. PPO receives normalized simulator state, not
-  camera pixels or a scripted one-hot clock.
+  gripper-to-ball and ball-to-cup relative positions, six task-state flags, and
+  elapsed episode fraction. PPO receives normalized simulator state, not camera
+  pixels or a scripted one-hot clock.
 - Approach shaping follows the demonstrated path: a waypoint 60 mm above the
   grasp site, then the grasp site's offset `(0.020, -0.008, -0.010)` m from
   the ball center with wrist flex `0.5` rad and wrist roll `-2.7` rad. A reach
@@ -68,12 +69,14 @@ finger collision meshes. Run the environment checks before training:
   falls or is knocked into the cup without a verified above-rim carry and
   release does not count as a successful placement.
 
-The reward is a sum of signed approach progress (`40` per meter), one-time
-grasp-pose reach `+3`, stable-grasp `+2`, signed ball-lift progress (`80` per
-meter, capped at the lift threshold), one-time lift `+2`, new-best held carry
-height progress (`80` per meter up to 20 mm above the cup rim), new-best held
-transport progress (`40` per meter), one-time above-cup `+3`, one-time verified
-release `+5`, and terminal success `+50`. It subtracts one-time outside-drop `5`, unsafe collision `0.25`,
+The reward is signed approach progress (`40` per meter), one-time grasp-pose
+reach `+3`, alignment-gated jaw-closure progress (up to `+8`), stable-grasp
+`+10`, and a penalty for moving the ball before a stable grasp. It adds signed
+ball-lift progress (`80` per meter, capped at the lift threshold), one-time lift
+`+2`, new-best held carry height progress (`80` per meter up to 20 mm above the
+cup rim), new-best held transport progress (`40` per meter), one-time above-cup
+`+3`, one-time verified release `+5`, and terminal success `+50`. It subtracts
+one-time outside-drop `5`, unsafe collision `0.25`,
 joint-limit clipping at `0.1` times the clipped target delta divided by the
 2-degree action limit, `0.01` per action step, and unrecoverable failure `10`.
 Progress is signed or best-so-far; event bonuses are one-time, so hovering,
@@ -89,8 +92,9 @@ across the pick-and-place horizon, and keeps entropy regularization enabled.
 State-dependent exploration holds coherent action noise for four control
 steps, giving the arm time to move in a direction before resampling.
 Observation normalization is enabled and reward normalization is off.
-Dense approach, grasp-pose, lift, and transport rewards guide PPO before the
-terminal placement reward.
+Dense approach, grasp-pose, jaw-closure, lift, and transport rewards guide PPO
+before the terminal placement reward. Jaw closure earns progress only when the
+gripper is aligned with the validated grasp position and wrist orientation.
 
 Every stage must reach 90% success over 50 evaluation episodes at three
 consecutive evaluation windows before the curriculum advances. Stage 1 trains
@@ -117,6 +121,16 @@ older runs. Checkpoints, Monitor episode CSV files, PPO's `progress.csv`, and
 deterministic evaluation results are saved there. Each stage is capped at
 1,000,000 steps, with evaluations every 25,000 steps after the first 100,000.
 Training reward does not advance the curriculum.
+
+To continue a run that learned to reach but not to grasp, pass its
+`latest_model.zip` checkpoint. This keeps the learned policy and observation
+normalization statistics, then starts a fresh Stage 1 fine-tuning budget with
+the updated grasp rewards:
+
+```bash
+.venv/bin/python -m experiments.train_ppo \
+  --resume-from outputs/ball_cup_ppo_state_feedback/run_<timestamp>/latest_model.zip
+```
 
 The randomization boxes are a conservative ±10 mm neighborhood of one
 verified scripted pick-and-place scene, not a complete IK-certified reachable

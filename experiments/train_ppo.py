@@ -165,7 +165,7 @@ def run_smoke_test(config, config_path):
         }, indent=2))
 
 
-def run_training(config, config_path, output_dir):
+def run_training(config, config_path, output_dir, resume_from=None):
     curriculum = config["curriculum"]
     ppo = config["ppo"]
     seed = int(config["seed"])
@@ -177,10 +177,27 @@ def run_training(config, config_path, output_dir):
         )
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    resume_normalization = None
+    if resume_from is not None:
+        resume_from = Path(resume_from).expanduser().resolve()
+        if not resume_from.is_file():
+            raise FileNotFoundError(f"Resume checkpoint not found: {resume_from}")
+        resume_normalization = resume_from.with_name(
+            f"{resume_from.stem}_vecnormalize.pkl"
+        )
+        if normalize and not resume_normalization.is_file():
+            raise FileNotFoundError(
+                "Resume checkpoint is missing its observation-normalization "
+                f"file: {resume_normalization}"
+            )
+
     print(f"Run artifacts: {output_dir}")
-    print("Starting PPO from a random policy; demonstrations are not used for training.")
+    if resume_from is None:
+        print("Starting PPO from a random policy; demonstrations are not used for training.")
+    else:
+        print(f"Resuming PPO weights and observation statistics from {resume_from}")
     run_metadata = {
-        "training_mode": "ppo_from_scratch",
+        "training_mode": "ppo_from_scratch" if resume_from is None else "ppo_resumed_finetune",
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "seed": seed,
         "stage_order": [1, 2, 3, 4, 5],
@@ -192,6 +209,7 @@ def run_training(config, config_path, output_dir):
         "pretrained_policy_used": False,
         "demonstration_action_anchor_used": False,
         "open_loop_clock_lookup_used": False,
+        "resumed_from": str(resume_from) if resume_from is not None else None,
         "runtime": _runtime_metadata(),
         "config": config,
     }
@@ -203,32 +221,39 @@ def run_training(config, config_path, output_dir):
         stage=1,
         seed=seed,
         output_dir=output_dir,
-        normalize=normalize,
+        normalize=False if resume_from is not None else normalize,
         config_path=config_path,
     )
-    model = PPO(
-        "MlpPolicy",
-        first_env,
-        learning_rate=float(ppo["learning_rate"]),
-        n_steps=int(ppo["rollout_steps"]),
-        batch_size=int(ppo["batch_size"]),
-        n_epochs=int(ppo["epochs"]),
-        gamma=float(ppo["gamma"]),
-        gae_lambda=float(ppo["gae_lambda"]),
-        clip_range=float(ppo["clip_range"]),
-        target_kl=float(ppo["target_kl"]),
-        ent_coef=float(ppo["entropy_coefficient"]),
-        vf_coef=float(ppo["value_coefficient"]),
-        max_grad_norm=float(ppo["max_gradient_norm"]),
-        use_sde=bool(ppo["use_state_dependent_exploration"]),
-        sde_sample_freq=int(
-            ppo["state_dependent_exploration_sample_freq"]
-        ),
-        policy_kwargs=_make_policy_kwargs(ppo),
-        seed=seed,
-        verbose=1,
-        device="cpu",
-    )
+    if resume_from is not None and normalize:
+        first_env = VecNormalize.load(str(resume_normalization), first_env)
+        first_env.training = True
+        first_env.norm_reward = False
+    if resume_from is None:
+        model = PPO(
+            "MlpPolicy",
+            first_env,
+            learning_rate=float(ppo["learning_rate"]),
+            n_steps=int(ppo["rollout_steps"]),
+            batch_size=int(ppo["batch_size"]),
+            n_epochs=int(ppo["epochs"]),
+            gamma=float(ppo["gamma"]),
+            gae_lambda=float(ppo["gae_lambda"]),
+            clip_range=float(ppo["clip_range"]),
+            target_kl=float(ppo["target_kl"]),
+            ent_coef=float(ppo["entropy_coefficient"]),
+            vf_coef=float(ppo["value_coefficient"]),
+            max_grad_norm=float(ppo["max_gradient_norm"]),
+            use_sde=bool(ppo["use_state_dependent_exploration"]),
+            sde_sample_freq=int(
+                ppo["state_dependent_exploration_sample_freq"]
+            ),
+            policy_kwargs=_make_policy_kwargs(ppo),
+            seed=seed,
+            verbose=1,
+            device="cpu",
+        )
+    else:
+        model = PPO.load(str(resume_from), env=first_env, device="cpu")
     model.set_logger(configure(str(output_dir / "sb3_logs"), ["stdout", "csv"]))
     save_bundle(model, output_dir, "initial_model")
     global_best = {"success_rate": 0.0, "stage": 1, "global_env_steps": 0}
@@ -285,7 +310,7 @@ def run_training(config, config_path, output_dir):
         model.learn(
             total_timesteps=int(curriculum["maximum_steps_per_stage"]),
             callback=callback,
-            reset_num_timesteps=(stage == 1),
+            reset_num_timesteps=(stage == 1 and resume_from is None),
             progress_bar=False,
             tb_log_name=f"stage_{stage:02d}",
         )
@@ -300,7 +325,11 @@ def run_training(config, config_path, output_dir):
         })
         (output_dir / "training_summary.json").write_text(
             json.dumps({
-                "training_mode": "ppo_from_scratch",
+                "training_mode": (
+                    "ppo_from_scratch"
+                    if resume_from is None
+                    else "ppo_resumed_finetune"
+                ),
                 "stages": stage_results,
                 "global_best": global_best,
                 "final_global_steps": int(model.num_timesteps),
@@ -334,6 +363,10 @@ def main(argv=None):
         help="Override the configured output directory",
     )
     parser.add_argument(
+        "--resume-from", type=Path, default=None,
+        help="Resume PPO weights and VecNormalize stats from a saved checkpoint",
+    )
+    parser.add_argument(
         "--smoke-test", action="store_true",
         help="Run 128 PPO steps plus a two-episode check, never the curriculum",
     )
@@ -351,7 +384,7 @@ def main(argv=None):
         output_dir = PROJECT_ROOT / config["logging"]["output_directory"] / run_id
     if not output_dir.is_absolute():
         output_dir = PROJECT_ROOT / output_dir
-    return run_training(config, config_path, output_dir)
+    return run_training(config, config_path, output_dir, resume_from=args.resume_from)
 
 
 if __name__ == "__main__":

@@ -385,6 +385,7 @@ class BallCupTrainingEnv(gym.Env):
             name: 0.0
             for name in (
                 "reach_progress", "reach_pose", "grasp", "lift_progress",
+                "grasp_closure_progress", "ungrasped_ball_displacement",
                 "carry_height_progress",
                 "lift",
                 "transport_progress",
@@ -395,6 +396,8 @@ class BallCupTrainingEnv(gym.Env):
         }
         self._previous_lift_progress = 0.0
         self._best_carry_height_progress = 0.0
+        self._previous_grasp_closure_potential = 0.0
+        self._previous_ball_displacement_potential = 0.0
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
@@ -427,6 +430,7 @@ class BallCupTrainingEnv(gym.Env):
 
         self._reset_episode_state()
         self._previous_approach_distance = self._approach_path_distance()[0]
+        self.initial_ball_xy = self.data.xpos[self.sim.ball_body, :2].copy()
         self._best_transport_distance = float(
             np.linalg.norm(self.data.xpos[self.sim.ball_body, :2] - self.data.xpos[self.sim.cup_body, :2])
         )
@@ -515,6 +519,27 @@ class BallCupTrainingEnv(gym.Env):
                 required_height - self.ball_radius,
             )
         )
+
+    def _grasp_closure_potential(self) -> float:
+        """Score jaw closure only when position and wrist match the grasp pose."""
+        _, position_error, wrist_error = self._approach_path_distance()
+        position_scale = float(self.task["grasp_alignment_position_scale_m"])
+        wrist_scale = float(self.task["grasp_alignment_wrist_scale_rad"])
+        alignment = float(np.exp(
+            -0.5 * (position_error / position_scale) ** 2
+            -0.5 * (wrist_error / wrist_scale) ** 2
+        ))
+        gripper_position = float(self.data.qpos[self.joint_qpos[5]])
+        closure_fraction = float(np.clip(
+            (self.open_gripper_target - gripper_position)
+            / max(
+                self.open_gripper_target - self.gripper_policy_close_target,
+                1e-8,
+            ),
+            0.0,
+            1.0,
+        ))
+        return alignment * closure_fraction
 
     def _cup_dimensions(self):
         # Geometry comes from the compiled octagonal cup: 50 mm wall-center
@@ -782,6 +807,39 @@ class BallCupTrainingEnv(gym.Env):
                 )
             if self.grasp_success and not previously_grasped:
                 reward_terms["grasp"] = float(self.reward_config["grasp_once"])
+            if not self.grasp_success:
+                grasp_potential = (
+                    float(self.reward_config["grasp_closure_progress_per_unit"])
+                    * self._grasp_closure_potential()
+                )
+                reward_terms["grasp_closure_progress"] = float(
+                    grasp_potential - self._previous_grasp_closure_potential
+                )
+                self._previous_grasp_closure_potential = grasp_potential
+
+                ball_displacement = float(np.linalg.norm(
+                    self.data.xpos[self.sim.ball_body, :2] - self.initial_ball_xy
+                ))
+                displacement_potential = -float(
+                    self.reward_config[
+                        "ungrasped_ball_displacement_per_meter"
+                    ]
+                ) * max(
+                    0.0,
+                    ball_displacement
+                    - float(self.task["ungrasped_ball_motion_tolerance_m"]),
+                )
+                reward_terms["ungrasped_ball_displacement"] = float(
+                    displacement_potential
+                    - self._previous_ball_displacement_potential
+                )
+                self._previous_ball_displacement_potential = (
+                    displacement_potential
+                )
+            else:
+                # A valid grasp can carry the ball away from its reset position.
+                self._previous_grasp_closure_potential = 0.0
+                self._previous_ball_displacement_potential = 0.0
             if self.grasp_success:
                 lift_progress = self._lift_progress_potential()
                 reward_terms["lift_progress"] = float(
