@@ -26,6 +26,8 @@ def assert_finite_observation(observation):
 def validate_action_mapping(env):
     observation, _ = env.reset(seed=19)
     assert_finite_observation(observation)
+    assert observation.shape == (OBSERVATION_SIZE,)
+    np.testing.assert_allclose(observation[-1], env._gripper_target, atol=1e-7)
     current = env.data.qpos[env.joint_qpos[:5]].copy()
     current_gripper = float(env.data.qpos[env.joint_qpos[5]])
     targets, gripper, _ = env.map_action_to_targets(np.ones(6, dtype=np.float32))
@@ -33,14 +35,10 @@ def validate_action_mapping(env):
         current + env.max_arm_delta, env.joint_ranges[:, 1]
     )
     np.testing.assert_allclose(targets, expected, atol=1e-7)
-    assert gripper == min(
-        env.open_gripper_target,
-        current_gripper + env.gripper_action_delta,
-    )
+    assert gripper == env.open_gripper_target
 
-    # Reset starts fully open, where a positive command must saturate rather
-    # than move farther. Check the exact bounded increment from that state,
-    # then repeat from an interior position to exercise both directions.
+    # Gripper commands accumulate from the prior target. A zero action must
+    # hold that target even while the measured jaw lags behind it.
     gripper_actions = np.zeros(6)
     gripper_actions[5] = -1.0
     _, closed, _ = env.map_action_to_targets(gripper_actions)
@@ -52,16 +50,22 @@ def validate_action_mapping(env):
         env.gripper_policy_close_target,
         current_gripper - env.gripper_action_delta,
     )
-    assert held == current_gripper
-    assert opened == min(
-        env.open_gripper_target,
-        current_gripper + env.gripper_action_delta,
+    assert held == closed
+    assert opened == current_gripper
+
+    env._gripper_target = closed
+    env.data.qpos[env.joint_qpos[5]] = current_gripper
+    _, held_while_lagging, _ = env.map_action_to_targets(
+        np.zeros(6, dtype=np.float32)
     )
+    assert held_while_lagging == closed
+    np.testing.assert_allclose(env._observation()[-1], closed, atol=1e-7)
 
     interior_gripper = 0.5 * (
         env.gripper_policy_close_target + env.open_gripper_target
     )
     env.data.qpos[env.joint_qpos[5]] = interior_gripper
+    env._gripper_target = interior_gripper
     mujoco.mj_forward(env.model, env.data)
     gripper_actions[5] = -1.0
     _, closed, _ = env.map_action_to_targets(gripper_actions)
@@ -70,9 +74,8 @@ def validate_action_mapping(env):
     gripper_actions[5] = 1.0
     _, opened, _ = env.map_action_to_targets(gripper_actions)
     assert closed == interior_gripper - env.gripper_action_delta
-    assert held == interior_gripper
-    assert opened == interior_gripper + env.gripper_action_delta
-    assert opened - interior_gripper <= env.gripper_action_delta + 1e-8
+    assert held == closed
+    assert opened == interior_gripper
 
     high = env.joint_ranges[0, 1]
     env.data.qpos[env.joint_qpos[0]] = high - 1e-4

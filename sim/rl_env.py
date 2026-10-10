@@ -16,7 +16,7 @@ from sim.training_config import load_training_config
 ARM_JOINT_NAMES = JOINT_NAMES[:5]
 CONTROL_HZ = 20
 PHYSICS_HZ = 500
-OBSERVATION_SIZE = 37
+OBSERVATION_SIZE = 38
 
 
 class BallCupTrainingEnv(gym.Env):
@@ -193,7 +193,7 @@ class BallCupTrainingEnv(gym.Env):
         )
         # 6 joint positions + 6 velocities + EE/ball/cup positions (9), ball
         # velocity (3), EE-to-ball and ball-to-cup vectors (6), six grasp/task
-        # flags, and elapsed episode fraction (1).
+        # flags, elapsed episode fraction, and the held gripper target.
         float32_limit = np.finfo(np.float32).max
         self.observation_space = spaces.Box(
             low=-float32_limit,
@@ -462,10 +462,10 @@ class BallCupTrainingEnv(gym.Env):
             np.sum(np.abs(requested - targets) / max(self.max_arm_delta, 1e-8))
         )
         gripper_action = float(action[5])
-        current_gripper = float(self.data.qpos[self.joint_qpos[5]])
         self._gripper_target = float(
             np.clip(
-                current_gripper + gripper_action * self.gripper_action_delta,
+                self._gripper_target
+                + gripper_action * self.gripper_action_delta,
                 self.gripper_policy_close_target,
                 self.open_gripper_target,
             )
@@ -620,6 +620,7 @@ class BallCupTrainingEnv(gym.Env):
                     float(self.released_over_cup),
                 ],
                 [self.steps / self.horizon],
+                [self._gripper_target],
             ]
         ).astype(np.float32)
         if observation.shape != (OBSERVATION_SIZE,):

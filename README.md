@@ -37,14 +37,15 @@ finger collision meshes. Run the environment checks before training:
   shoulder pan, shoulder lift, elbow, wrist flex, and wrist roll targets by at
   most 2 degrees relative to current measured joint positions. Targets clip to
   the model's joint limits. The sixth changes the gripper target by at most
-  0.1 rad per 20 Hz action, relative to its measured joint position, and clips
-  to the validated pinch target (`0.28` rad) and open target. Existing position
+  0.1 rad per 20 Hz action, relative to its previous commanded target, and
+  clips to the validated pinch target (`0.28` rad) and open target. A zero
+  action holds that target while the servo catches up. Existing position
   servos and force limits remain in use.
-- The observation contains 37 physical values: six measured joint positions,
+- The observation contains 38 physical values: six measured joint positions,
   six measured velocities, gripper XYZ, ball XYZ, cup XYZ, ball linear velocity,
-  gripper-to-ball and ball-to-cup relative positions, six task-state flags, and
-  elapsed episode fraction. PPO receives normalized simulator state, not camera
-  pixels or a scripted one-hot clock.
+  gripper-to-ball and ball-to-cup relative positions, six task-state flags,
+  elapsed episode fraction, and the commanded gripper target. PPO receives
+  normalized simulator state, not camera pixels or a scripted one-hot clock.
 - Approach shaping follows the demonstrated path: a waypoint 60 mm above the
   grasp site, then the grasp site's offset `(0.020, -0.008, -0.010)` m from
   the ball center with wrist flex `0.5` rad and wrist roll `-2.7` rad. A reach
@@ -83,8 +84,8 @@ Progress is signed or best-so-far; event bonuses are one-time, so hovering,
 oscillating, or repeating grasps cannot farm reward. All weights and thresholds
 are in `config/ppo_training.json`.
 
-PPO uses Stable-Baselines3 with randomly initialized `[512, 512]` tanh actor
-and critic networks. Training starts from Stage 1 and learns from environment
+PPO uses Stable-Baselines3 with `[512, 512]` tanh actor and critic networks.
+A new run starts from randomly initialized weights and learns from environment
 rewards; the hardcoded expert is not used to initialize, update, evaluate, or
 pass the policy. PPO starts with a trainable action standard deviation of
 `0.25`, uses `gamma = 0.995` and `GAE lambda = 0.98` to carry credit farther
@@ -100,8 +101,9 @@ Every stage must reach 90% success over 50 evaluation episodes at three
 consecutive evaluation windows before the curriculum advances. Stage 1 trains
 PPO from scratch on the fixed scene. Stage 2 randomizes the ball, Stage 3 also
 randomizes the cup, Stage 4 adds start-joint jitter, and Stage 5 adds cup size
-variation. Stage 1 is allowed its full budget even if early evaluations have
-no grasps. Later stages retain the zero-grasp early-stop safeguard.
+variation. A fresh Stage 1 run keeps its full budget while learning. A resumed
+run stops after three consecutive evaluation windows with no stable grasps,
+which prevents another million-step run that has made no grasp progress.
 
 Run a short PPO train/evaluate/checkpoint-reload smoke test, then launch the
 full five-stage curriculum:
@@ -122,14 +124,16 @@ deterministic evaluation results are saved there. Each stage is capped at
 1,000,000 steps, with evaluations every 25,000 steps after the first 100,000.
 Training reward does not advance the curriculum.
 
-To continue a run that learned to reach but not to grasp, pass its
-`latest_model.zip` checkpoint. This keeps the learned policy and observation
-normalization statistics, then starts a fresh Stage 1 fine-tuning budget with
-the updated grasp rewards:
+To continue from the earlier PPO checkpoint that learned to grasp and lift,
+pass its `latest_model.zip`. The resume code migrates its 25-value observation
+and normalization statistics into the current 38-value observation, preserves
+the learned policy weights, and fine-tunes Stage 1. This uses a learned PPO
+checkpoint, not the scripted expert. Do not resume the later failed checkpoint:
+it reached the ball but had 0% grasp success.
 
 ```bash
 .venv/bin/python -m experiments.train_ppo \
-  --resume-from outputs/ball_cup_ppo_state_feedback/run_<timestamp>/latest_model.zip
+  --resume-from outputs/ball_cup_ppo_state_feedback/run_20261006_230517_058123_utc/latest_model.zip
 ```
 
 The randomization boxes are a conservative ±10 mm neighborhood of one
