@@ -1,0 +1,18 @@
+{
+  "training_mode": "ppo_policy_migration_finetune",
+  "stages": [
+    {
+      "stage": 1,
+      "outcome": "failed_maximum_budget",
+      "steps": 1000000,
+      "consecutive_passing_evaluations": 0,
+      "best_evaluation_success_rate": 0.0
+    }
+  ],
+  "global_best": {
+    "success_rate": 0.0,
+    "stage": 1,
+    "global_env_steps": 0
+  },
+  "final_global_steps": 2000000
+}

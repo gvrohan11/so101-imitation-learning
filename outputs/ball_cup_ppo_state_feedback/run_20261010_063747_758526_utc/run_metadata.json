@@ -1,0 +1,170 @@
+{
+  "training_mode": "ppo_policy_migration_finetune",
+  "created_at_utc": "2026-10-10T06:37:49.053515+00:00",
+  "seed": 7,
+  "stage_order": [
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "observation_size": 38,
+  "source_observation_size": 25,
+  "policy_migration": true,
+  "use_state_dependent_exploration": false,
+  "policy_layers": [
+    512,
+    512
+  ],
+  "initial_action_std": 0.25,
+  "learning_rate": 0.0001,
+  "scripted_demonstration_used": false,
+  "pretrained_policy_used": true,
+  "demonstration_action_anchor_used": false,
+  "open_loop_clock_lookup_used": false,
+  "resumed_from": "/workspace/so101-imitation-learning/outputs/ball_cup_ppo_state_feedback/run_20261006_230517_058123_utc/latest_model.zip",
+  "runtime": {
+    "python": "3.12.3",
+    "platform": "Linux-6.8.0-85-generic-x86_64-with-glibc2.39",
+    "packages": {
+      "mujoco": "3.14.0",
+      "stable-baselines3": "2.9.0",
+      "gymnasium": "1.3.0",
+      "numpy": "2.2.6",
+      "torch": "2.11.0+cu128"
+    },
+    "git_revision": "af1238c057fe816b78d7b80aa0d4f46b18740594",
+    "git_dirty": false
+  },
+  "config": {
+    "seed": 7,
+    "task": {
+      "control_hz": 20,
+      "episode_steps": 500,
+      "arm_delta_degrees": 2.0,
+      "grasp_site_offset_m": [
+        0.02,
+        -0.008,
+        -0.01
+      ],
+      "grasp_approach_clearance_m": 0.06,
+      "grasp_wrist_flex_rad": 0.5,
+      "grasp_wrist_roll_rad": -2.7,
+      "grasp_pose_reach_threshold_m": 0.015,
+      "grasp_wrist_reach_tolerance_rad": 0.2,
+      "grasp_orientation_distance_scale_m_per_rad": 0.02,
+      "gripper_policy_close_target_rad": 0.28,
+      "gripper_action_delta_rad": 0.1,
+      "grasp_alignment_position_scale_m": 0.025,
+      "grasp_alignment_wrist_scale_rad": 0.35,
+      "ungrasped_ball_motion_tolerance_m": 0.005,
+      "fixed_ball_xy": [
+        0.18573629335106726,
+        -0.19801668373657652
+      ],
+      "fixed_cup_xy": [
+        0.2554784674928582,
+        0.12079146855055481
+      ],
+      "fixed_arm_start_rad": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "ball_xy_bounds": [
+        [
+          0.17573629335106725,
+          0.19573629335106726
+        ],
+        [
+          -0.20801668373657653,
+          -0.1880166837365765
+        ]
+      ],
+      "cup_xy_bounds": [
+        [
+          0.2454784674928582,
+          0.2654784674928582
+        ],
+        [
+          0.11079146855055481,
+          0.1307914685505548
+        ]
+      ],
+      "start_joint_jitter_degrees": 2.0,
+      "ball_mass_kg": 0.0027,
+      "ball_radius_variants_m": [
+        0.02
+      ],
+      "cup_scale_variants": [
+        0.9,
+        1.0,
+        1.1
+      ],
+      "minimum_cup_opening_to_ball_diameter_ratio": 1.8,
+      "lift_threshold_z_m": 0.035,
+      "pinch_stability_seconds": 0.1,
+      "placement_stability_seconds": 0.25,
+      "cup_rim_clearance_m": 0.02,
+      "ball_unrecoverable_z_m": -0.08,
+      "evaluation_success_xy_margin_m": 0.003
+    },
+    "reward": {
+      "reach_progress_per_meter": 40.0,
+      "reach_pose_once": 3.0,
+      "grasp_once": 10.0,
+      "grasp_closure_progress_per_unit": 8.0,
+      "ungrasped_ball_displacement_per_meter": 100.0,
+      "lift_progress_per_meter": 80.0,
+      "lift_once": 2.0,
+      "carry_height_progress_per_meter": 80.0,
+      "transport_progress_per_meter": 40.0,
+      "above_cup_once": 3.0,
+      "correct_release_once": 5.0,
+      "terminal_success": 50.0,
+      "dropped_outside_cup_once": 5.0,
+      "unsafe_contact_once": 0.25,
+      "joint_limit_clip_per_normalized_action_unit": 0.1,
+      "per_step_time_cost": 0.01,
+      "unrecoverable_failure": 10.0
+    },
+    "curriculum": {
+      "minimum_steps_per_stage": 100000,
+      "evaluation_interval_steps": 25000,
+      "evaluation_episodes": 50,
+      "required_success_rate": 0.9,
+      "consecutive_passing_evaluations": 3,
+      "maximum_consecutive_zero_grasp_evaluations": 3,
+      "maximum_steps_per_stage": 1000000
+    },
+    "ppo": {
+      "learning_rate": 0.0001,
+      "rollout_steps": 2048,
+      "batch_size": 256,
+      "epochs": 5,
+      "gamma": 0.995,
+      "gae_lambda": 0.98,
+      "clip_range": 0.2,
+      "entropy_coefficient": 0.005,
+      "initial_action_std": 0.25,
+      "use_state_dependent_exploration": true,
+      "state_dependent_exploration_sample_freq": 4,
+      "target_kl": 0.03,
+      "value_coefficient": 0.5,
+      "max_gradient_norm": 0.5,
+      "policy_layers": [
+        512,
+        512
+      ],
+      "normalize_observations": true
+    },
+    "logging": {
+      "output_directory": "outputs/ball_cup_ppo_state_feedback",
+      "checkpoint_interval_steps": 25000,
+      "monitor_episodes": true
+    }
+  }
+}
